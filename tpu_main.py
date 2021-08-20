@@ -89,7 +89,6 @@ def map_fn(index: int, config) -> None:
         val_loss_reduced, val_metrics_reduced = reduce_val_and_dict("val_loss_acc_reduce",
                                                                     val_loss_accumulator.compute(),
                                                                     val_metrics.compute())
-
         train_metrics.reset()
         val_metrics.reset()
         val_loss_accumulator.reset()
@@ -149,8 +148,8 @@ if __name__ == "__main__":
                         help="number of workers for dataloders (default: 0)")
     parser.add_argument("--bucket", type=str, default='',
                         help="a bucket where fullram dataset tensors are stored (default:'')")
-    parser.add_argument("--base_channels", type=int, default=8,
-                        help=" nnet base channels (default: 8) ")
+    parser.add_argument("--base_channels", type=int, default=4,
+                        help=" nnet base channels (default: 4) ")
     parser.add_argument("--use_batchnorm", action="store_true",
                         help=" use batchnorm in the model ")
     parser.add_argument("--synthetic_data", action="store_true",

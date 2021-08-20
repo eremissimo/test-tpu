@@ -1,5 +1,7 @@
 import os
+import gc
 import torch
+import torch.nn.functional as ff
 from torch.utils.data import Dataset, TensorDataset
 from torchvision.transforms import Compose
 from typing import Tuple, Optional, Callable
@@ -22,11 +24,26 @@ def download_datasets(config: dict, data_path: str) -> Tuple[Dataset, Dataset]:
         train_path = os.path.join(data_path, "train.pt")
         val_path = os.path.join(data_path, "test.pt")
         os.makedirs(data_path, exist_ok=True)
-        load_from_bucket(config["bucket"], train_path)
-        load_from_bucket(config["bucket"], val_path)
+        if os.path.isfile(train_path):
+            print("train.pt is found in data folder. Skipping download phase ... ")
+        else:
+            load_from_bucket(config["bucket"], train_path)
+        if os.path.isfile(val_path):
+            print("test.pt is found in data folder. Skipping download phase ... ")
+        else:
+            load_from_bucket(config["bucket"], val_path)
         train_data_tensors: Tuple[torch.Tensor, torch.Tensor] = torch.load(train_path)  # img, target_segmentation
         val_data_tensors: Tuple[torch.Tensor, torch.Tensor] = torch.load(val_path)
+        if (defect := train_data_tensors[0].shape[2] % 128) != 0:
+            print("Extra padding -> ", end="")
+            defect = defect // 2
+            pad_dim = [0, 0] + [defect]*4
+            train_data_tensors = ff.pad(train_data_tensors[0], pad_dim), ff.pad(train_data_tensors[1], pad_dim)
+            val_data_tensors = ff.pad(val_data_tensors[0], pad_dim), ff.pad(val_data_tensors[1], pad_dim)
+            gc.collect()
+            print(train_data_tensors[0].shape)
     print("Instantiating dataset classes...  ", end="")
+
     transform = Compose([random_x_flip_tuple, to_float32_int64])
     train_dataset = TransformTensorDataset(train_data_tensors, transform=transform)
     val_dataset = TransformTensorDataset(val_data_tensors, transform=transform)
