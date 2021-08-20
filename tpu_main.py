@@ -27,7 +27,6 @@ N_CLASSES = 4
 def map_fn(index: int, config) -> None:
     torch.manual_seed(111)
     device = xm.xla_device()
-    print(device)
 
     # 1. DATASETS (only in rank 0 process)
     brats_train_dataset, brats_val_dataset = SERIAL_EXEC.run(lambda: download_datasets(config, data_path=DATA_PATH))
@@ -58,6 +57,8 @@ def map_fn(index: int, config) -> None:
                                         "tacc": mtr.Accuracy(compute_on_step=False, ignore_index=0)},
                                        prefix="Valid/").to(device)
     val_loss_accumulator = mtr.AverageMeter(compute_on_step=False).to(device)
+    class_weights = torch.tensor([0.0028, 2.2711, 0.5229, 1.2033], device=device)   # precomputed from entire dataset
+
 
     xm.master_print("Training ........ ")
 
@@ -69,7 +70,7 @@ def map_fn(index: int, config) -> None:
         for img, seg_t in train_loader_with_tqdm:
             optimizer.zero_grad()
             logits = model(img)
-            loss = ff.cross_entropy(logits, seg_t, weight=get_ce_weights(seg_t))
+            loss = ff.cross_entropy(logits, seg_t, weight=class_weights)
             loss.backward()
             xm.optimizer_step(optimizer)
             lr_scheduler.step()
@@ -83,7 +84,7 @@ def map_fn(index: int, config) -> None:
         with torch.no_grad():
             for img, seg_t in val_device_loader:
                 logits = model(img)
-                loss_v = ff.cross_entropy(logits, seg_t, weight=get_ce_weights(seg_t))
+                loss_v = ff.cross_entropy(logits, seg_t, weight=class_weights)
                 val_loss_accumulator.update(loss_v)
                 val_metrics.update(logits, seg_t)
         val_loss_reduced, val_metrics_reduced = reduce_val_and_dict("val_loss_acc_reduce",
@@ -160,4 +161,5 @@ if __name__ == "__main__":
     WRAPPED_MODEL = xmp.MpModelWrapper(SImple(n_chan=config["base_channels"], use_norm=config["use_batchnorm"]))
     SERIAL_EXEC = xmp.MpSerialExecutor()
 
-    xmp.spawn(map_fn, args=(config,), nprocs=xm.xrt_world_size(), start_method='fork')
+    print(xm.get_xla_supported_devices())
+    xmp.spawn(map_fn, args=(config,), nprocs=8, start_method='fork')
