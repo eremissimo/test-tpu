@@ -11,12 +11,11 @@ from tqdm import tqdm
 import torchmetrics as mtr
 
 import torch_xla
-import torch_xla.debug.metrics as met
+# import torch_xla.debug.metrics as met
 import torch_xla.distributed.parallel_loader as pl
-# import torch_xla.utils.utils as xu
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
-# import torch_xla.test.test_utils as test_utils
+
 
 
 # os.environ["XLA_USE_BF16"] = 1
@@ -27,7 +26,6 @@ N_CLASSES = 4
 def map_fn(index: int, config) -> None:
     torch.manual_seed(111)
     device = xm.xla_device()
-    print(device)
     
     # 1. DATASETS (only in rank 0 process)
     brats_train_dataset, brats_val_dataset = SERIAL_EXEC.run(lambda: download_datasets(config, data_path=DATA_PATH))
@@ -44,7 +42,6 @@ def map_fn(index: int, config) -> None:
     train_device_loader = pl.MpDeviceLoader(train_loader, device)
     val_device_loader = pl.MpDeviceLoader(val_loader, device)
     train_num_batches = len(train_device_loader)
-    # val_num_batches = len(val_device_loader)
 
     # 3. MODELS & METRICS
     model = WRAPPED_MODEL.to(device)
@@ -97,8 +94,7 @@ def map_fn(index: int, config) -> None:
         xm.master_print(f" Epoch {epoch} training: last loss = {loss},  {train_metrics_reduced} \n",
                         f"Epoch {epoch} validation: avg loss = {val_loss_reduced},  {val_metrics_reduced}")
 
-    print(met.metrics_report())
-    print("woah! ")
+    # xm.master_print(met.metrics_report())
 
 
 def reduce_fn(x):
@@ -111,18 +107,13 @@ def reduce_val(tag: str, x: torch.Tensor):
 
 
 def reduce_dict(tag: str, x: dict):
-    tensor_list = list(x.values())
-    tensor_list = xm.mesh_reduce(tag, tensor_list, reduce_fn)
-    x_reduced = {k: v for k, v in zip(x.keys(), tensor_list)}
+    x_reduced = {k: xm.mesh_reduce(tag + k, v, reduce_fn) for k, v in x.items()}
     return x_reduced
 
 
 def reduce_val_and_dict(tag: str, value: torch.Tensor, dictionary: dict):
-    tensor_list = list(dictionary.values())
-    tensor_list.append(value)
-    tensor_list = xm.mesh_reduce(tag, tensor_list, reduce_fn)
-    value_reduced = tensor_list.pop()
-    dict_reduced = {k: v for k, v in zip(dictionary.keys(), tensor_list)}
+    value_reduced = xm.mesh_reduce(tag + "_value", value, reduce_fn)
+    dict_reduced = reduce_dict(tag+"_dict", dictionary)
     return value_reduced, dict_reduced
 
 

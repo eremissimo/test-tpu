@@ -20,16 +20,17 @@ def download_datasets(config: dict, data_path: str) -> Tuple[Dataset, Dataset]:
         v_seg = torch.randint(low=0, high=3, size=(n_val, *spatial_shape))
         train_data_tensors = (t_img, t_seg)
         val_data_tensors = (v_img, v_seg)
+        print("Beware: all replicas would have different generated data tensors! ")
     else:
         train_path = os.path.join(data_path, "train.pt")
         val_path = os.path.join(data_path, "test.pt")
         os.makedirs(data_path, exist_ok=True)
         if os.path.isfile(train_path):
-            print("train.pt is found in data folder. Skipping download phase ... ")
+            print("train.pt is found in the data folder. Skipping download phase ... ")
         else:
             load_from_bucket(config["bucket"], train_path)
         if os.path.isfile(val_path):
-            print("test.pt is found in data folder. Skipping download phase ... ")
+            print("test.pt is found in the data folder. Skipping download phase ... ")
         else:
             load_from_bucket(config["bucket"], val_path)
         train_data_tensors: Tuple[torch.Tensor, torch.Tensor] = torch.load(train_path)  # img, target_segmentation
