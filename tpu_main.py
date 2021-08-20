@@ -27,7 +27,8 @@ N_CLASSES = 4
 def map_fn(index: int, config) -> None:
     torch.manual_seed(111)
     device = xm.xla_device()
-
+    print(device)
+    
     # 1. DATASETS (only in rank 0 process)
     brats_train_dataset, brats_val_dataset = SERIAL_EXEC.run(lambda: download_datasets(config, data_path=DATA_PATH))
 
@@ -161,5 +162,4 @@ if __name__ == "__main__":
     WRAPPED_MODEL = xmp.MpModelWrapper(SImple(n_chan=config["base_channels"], use_norm=config["use_batchnorm"]))
     SERIAL_EXEC = xmp.MpSerialExecutor()
 
-    print(xm.get_xla_supported_devices())
     xmp.spawn(map_fn, args=(config,), nprocs=8, start_method='fork')
