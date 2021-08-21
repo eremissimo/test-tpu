@@ -5,7 +5,7 @@ import torch.nn.functional as ff
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from tpu_models import SImple
+from tpu_dirac_models import SImpleDirac
 from tpu_data import download_datasets
 from tqdm import tqdm
 import torchmetrics as mtr
@@ -27,7 +27,7 @@ def map_fn(index: int, config) -> None:
     torch.manual_seed(111)
     device = xm.xla_device()
     
-    # 1. DATASETS (only in rank 0 process)
+    # 1. DATASETS
     brats_train_dataset, brats_val_dataset = SERIAL_EXEC.run(lambda: download_datasets(config, data_path=DATA_PATH))
 
     # 2. DATALOADERS
@@ -91,7 +91,7 @@ def map_fn(index: int, config) -> None:
         train_metrics.reset()
         val_metrics.reset()
         val_loss_accumulator.reset()
-        xm.master_print(f" Epoch {epoch} training: last loss = {loss},  {train_metrics_reduced} \n",
+        xm.master_print(f" Epoch {epoch} training: curr loss = {loss},  {train_metrics_reduced} \n",
                         f"Epoch {epoch} validation: avg loss = {val_loss_reduced},  {val_metrics_reduced}")
 
     # xm.master_print(met.metrics_report())
@@ -147,10 +147,12 @@ if __name__ == "__main__":
                         help=" use batchnorm in the model ")
     parser.add_argument("--synthetic_data", action="store_true",
                         help=" use synthetic random data instead of downloading examples from a bucket ")
+
     args = parser.parse_args()
     config = args.__dict__
 
-    WRAPPED_MODEL = xmp.MpModelWrapper(SImple(n_chan=config["base_channels"], use_norm=config["use_batchnorm"]))
+    # WRAPPED_MODEL = xmp.MpModelWrapper(SImple(n_chan=config["base_channels"], use_norm=config["use_batchnorm"]))
+    WRAPPED_MODEL = xmp.MpModelWrapper(SImpleDirac(n_chan=config["base_channels"]))
     SERIAL_EXEC = xmp.MpSerialExecutor()
 
     xmp.spawn(map_fn, args=(config,), nprocs=8, start_method='fork')
