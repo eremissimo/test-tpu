@@ -35,15 +35,6 @@ def download_datasets(config: dict, data_path: str) -> Tuple[Dataset, Dataset]:
             load_from_bucket(config["bucket"], val_path)
         train_data_tensors: Tuple[torch.Tensor, torch.Tensor] = torch.load(train_path)  # img, target_segmentation
         val_data_tensors: Tuple[torch.Tensor, torch.Tensor] = torch.load(val_path)
-        defect = train_data_tensors[0].shape[2] % 128
-        if defect != 0:
-            print(f"Extra padding: {train_data_tensors[0].shape} -> ", end="")
-            defect = (128 - defect) // 2
-            pad_dim = [0, 0] + [defect]*4
-            train_data_tensors = ff.pad(train_data_tensors[0], pad_dim), ff.pad(train_data_tensors[1], pad_dim)
-            val_data_tensors = ff.pad(val_data_tensors[0], pad_dim), ff.pad(val_data_tensors[1], pad_dim)
-            gc.collect()
-            print(train_data_tensors[0].shape)
     print("Instantiating dataset classes...  ", end="")
 
     transform = Compose([random_x_flip_tuple, to_float32_int64])
