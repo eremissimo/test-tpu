@@ -5,7 +5,7 @@ import torch.nn.functional as ff
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from tpu_models import SImple
+from tpu_models import SImple, ContrNet
 from tpu_data import download_datasets
 from tqdm import tqdm
 import torchmetrics as mtr
@@ -145,7 +145,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     config = args.__dict__
 
-    WRAPPED_MODEL = xmp.MpModelWrapper(SImple(n_chan=config["base_channels"], use_norm=config["use_batchnorm"]))
+    WRAPPED_MODEL = xmp.MpModelWrapper(ContrNet(n_chan=config["base_channels"], kernel_size=5, use_norm=config["use_batchnorm"]))
     # WRAPPED_MODEL = xmp.MpModelWrapper(SImpleDirac(n_chan=config["base_channels"]))
     SERIAL_EXEC = xmp.MpSerialExecutor()
 
