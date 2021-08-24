@@ -145,7 +145,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     config = args.__dict__
 
-    WRAPPED_MODEL = xmp.MpModelWrapper(ContrNet(n_chan=config["base_channels"], kernel_size=5, use_norm=config["use_batchnorm"]))
+    WRAPPED_MODEL = xmp.MpModelWrapper(ContrNet(n_chan=config["base_channels"], kernel_size=3, use_norm=config["use_batchnorm"]))
     # WRAPPED_MODEL = xmp.MpModelWrapper(SImpleDirac(n_chan=config["base_channels"]))
     SERIAL_EXEC = xmp.MpSerialExecutor()
 
