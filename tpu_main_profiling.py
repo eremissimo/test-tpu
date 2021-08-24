@@ -56,13 +56,12 @@ def map_fn(index: int, config) -> None:
     val_loss_accumulator = mtr.AverageMeter(compute_on_step=False).to(device)
     class_weights = torch.tensor([0.0028, 2.2711, 0.5229, 1.2033], device=device)   # precomputed from entire dataset
 
+    server = xp.start_server(9012)      # profiler
 
     xm.master_print("Training ........ ")
-    train_avg_loss = torch.tensor(0., device=device)
-
-    server = xp.start_server(9012)
 
     # 5. TRAINING & VALIDATION LOOPS
+    train_avg_loss = torch.tensor(0., device=device)
     for epoch in range(config["epochs"]):
         train_loader_with_tqdm = tqdm(train_device_loader, total=train_num_batches, desc=f"Epoch {epoch}",
                                       disable=not xm.is_master_ordinal())
@@ -79,8 +78,7 @@ def map_fn(index: int, config) -> None:
                 xm.optimizer_step(optimizer)
                 lr_scheduler.step()
                 train_avg_loss += loss.detach()
-        # compute metrics here
-        train_avg_loss_reduced = reduce_val("train_loss_reduce", train_avg_loss/train_num_batches)
+
 
         # 5.2 validation loop
         model.eval()
@@ -91,10 +89,11 @@ def map_fn(index: int, config) -> None:
                     loss_v = ff.cross_entropy(logits, seg_t, weight=class_weights)
                     val_loss_accumulator.update(loss_v)
                     val_metrics.update(logits, seg_t)
-        # compute metrics here
-        val_loss_reduced, val_metrics_reduced = reduce_val_and_dict("val_loss_acc_reduce",
-                                                                    val_loss_accumulator.compute(),
-                                                                    val_metrics.compute())
+        # per-device compute metrics and then all_reduce them across devices
+        train_avg_loss_reduced = reduce_val("train_loss_reduce", train_avg_loss/train_num_batches)
+        val_loss_reduced = reduce_val("val_loss_reduce", val_loss_accumulator.compute())
+        val_metrics_reduced = reduce_dict("val_metrics_reduce", val_metrics.compute())
+
         val_metrics.reset()
         val_loss_accumulator.reset()
         xm.master_print(f" Epoch {epoch} training: curr loss = {loss},  avg loss = {train_avg_loss_reduced} \n",

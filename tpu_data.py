@@ -20,7 +20,7 @@ def download_datasets(config: dict, data_path: str) -> Tuple[Dataset, Dataset]:
         v_seg = torch.randint(low=0, high=3, size=(n_val, *spatial_shape))
         train_data_tensors = (t_img, t_seg)
         val_data_tensors = (v_img, v_seg)
-        print("Beware: all replicas would have different generated data tensors! ")
+        print("Beware: all replicas have different generated data tensors! ")
     else:
         train_path = os.path.join(data_path, "train.pt")
         val_path = os.path.join(data_path, "test.pt")

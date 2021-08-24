@@ -23,7 +23,7 @@ DATA_PATH = os.path.join(os.getcwd(), "data")
 N_CLASSES = 4
 
 
-def map_fn(index: int, config) -> None:
+def map_fn(index: int, config: dict) -> None:
     torch.manual_seed(111)
     device = xm.xla_device()
     
@@ -42,6 +42,7 @@ def map_fn(index: int, config) -> None:
     train_device_loader = pl.MpDeviceLoader(train_loader, device)
     val_device_loader = pl.MpDeviceLoader(val_loader, device)
     train_num_batches = len(train_device_loader)
+    val_num_batches = len(val_device_loader)
 
     # 3. MODELS & METRICS
     model = WRAPPED_MODEL.to(device)
@@ -51,12 +52,12 @@ def map_fn(index: int, config) -> None:
     val_metrics = mtr.MetricCollection({"acc": mtr.Accuracy(compute_on_step=False),
                                         "tacc": mtr.Accuracy(compute_on_step=False, ignore_index=0)},
                                        prefix="Valid/").to(device)
-    val_loss_accumulator = mtr.AverageMeter(compute_on_step=False).to(device)
     class_weights = torch.tensor([0.0028, 2.2711, 0.5229, 1.2033], device=device)   # precomputed from entire dataset
 
 
     xm.master_print("Training ........ ")
     train_avg_loss = torch.tensor(0., device=device)
+    val_avg_loss = torch.tensor(0., device=device)
 
     # 5. TRAINING & VALIDATION LOOPS
     for epoch in range(config["epochs"]):
@@ -68,28 +69,27 @@ def map_fn(index: int, config) -> None:
         for img, seg_t in train_loader_with_tqdm:
             optimizer.zero_grad()
             logits = model(img)
-            loss = ff.cross_entropy(logits, seg_t, weight=class_weights)
+            loss = ff.cross_entropy(logits, seg_t, weight=get_ce_weights(seg_t))
             loss.backward()
             xm.optimizer_step(optimizer)
             lr_scheduler.step()
             train_avg_loss += loss.detach()
-        # compute metrics here
-        train_avg_loss_reduced = reduce_val("train_loss_reduce", train_avg_loss/train_num_batches)
 
         # 5.2 validation loop
         model.eval()
+        val_avg_loss.zero_()
         with torch.no_grad():
             for img, seg_t in val_device_loader:
                 logits = model(img)
-                loss_v = ff.cross_entropy(logits, seg_t, weight=class_weights)
-                val_loss_accumulator.update(loss_v)
+                loss_v = ff.cross_entropy(logits, seg_t, weight=get_ce_weights(seg_t))
+                val_avg_loss += loss_v
                 val_metrics.update(logits, seg_t)
-        # compute metrics here
-        val_loss_reduced = reduce_val("val_loss_reduce", val_loss_accumulator.compute())
-        val_metrics_reduced = reduce_dict("val_metrics_reduce", val_metrics.compute())
 
+        # 5.3 training and validation metrics
+        train_avg_loss_reduced = reduce_val("train_loss_reduce", train_avg_loss/train_num_batches)
+        val_loss_reduced = reduce_val("val_loss_reduce", val_avg_loss/val_num_batches)
+        val_metrics_reduced = reduce_dict("val_metrics_reduce", val_metrics.compute())
         val_metrics.reset()
-        val_loss_accumulator.reset()
         xm.master_print(f" Epoch {epoch} training: curr loss = {loss},  avg loss = {train_avg_loss_reduced} \n",
                         f"Epoch {epoch} validation: avg loss = {val_loss_reduced},  {val_metrics_reduced}")
 
@@ -112,7 +112,8 @@ def reduce_dict(tag: str, x: dict):
 
 def get_ce_weights(seg_t: torch.Tensor) -> torch.Tensor:
     """ Normalization coefficients for CE loss """
-    counts = torch.flatten(seg_t).bincount(minlength=N_CLASSES)
+    # torch.bincount is not supported by xla unfortunately
+    counts = torch.stack([(seg_t == i).sum() for i in range(N_CLASSES)])
     weights = 1.0/counts
     weights = N_CLASSES*weights/weights.sum()
     return weights
