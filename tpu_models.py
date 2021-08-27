@@ -102,9 +102,9 @@ class To2d(nn.Module):
 
 class To3d(nn.Module):
     """ Inverse of To2d """
-    def __init__(self, original_batch_size: int, dim_from_batch: int = 2):
+    def __init__(self, original_spatial_size: int, dim_from_batch: int = 2):
         super().__init__()
-        self.batch_size = original_batch_size
+        self.orig_sp_size = original_spatial_size
         spatials_dim_idxs = [3, 4]
         spatials_dim_idxs.insert(dim_from_batch - 2, 1)
         self.perm_dims = [0, 2, *spatials_dim_idxs]
@@ -113,7 +113,7 @@ class To3d(nn.Module):
         # restoring original dimensions
         # [B*X, C, Y, Z] -> [B, X, C, Y, Z] -> [B, C, X, Y, Z]
         # op = x.view(sz[0], sz[2], *x.shape[1:]).transpose(1, 2)
-        op = x.view(self.batch_size, -1, *x.shape[1:]).permute(self.perm_dims)   # maybe .contiguous() ?
+        op = x.view(-1, self.orig_sp_size, *x.shape[1:]).permute(self.perm_dims)   # maybe .contiguous() ?
         return op
 
 
@@ -195,16 +195,16 @@ class SImple(nn.Sequential):
 
 
 class Conv232d(nn.Sequential):
-    def __init__(self, batch_size: int, encoder2d: nn.Module, bottleneck3d: nn.Module, decoder2d: nn.Module,
+    def __init__(self, spatial_size: int, encoder2d: nn.Module, bottleneck3d: nn.Module, decoder2d: nn.Module,
                  leaping_dim: int = 2):
         super().__init__(
             To2d(dim_to_batch=leaping_dim),
             encoder2d,
-            To3d(batch_size, dim_from_batch=leaping_dim),
+            To3d(spatial_size, dim_from_batch=leaping_dim),
             bottleneck3d,
             To2d(dim_to_batch=leaping_dim),
             decoder2d,
-            To3d(batch_size, dim_from_batch=leaping_dim)
+            To3d(spatial_size, dim_from_batch=leaping_dim)
         )
 
 
@@ -214,7 +214,7 @@ def _t31(k: int, i: int, defval: int = 1) -> Tuple[int, ...]:
     return tuple(t)
 
 
-def conv232_assembly(n_chan: int, batch_size: int, use_norm: bool = True, leaping_dim: int = 2,
+def conv232_assembly(n_chan: int, spatial_size: int, use_norm: bool = True, leaping_dim: int = 2,
                      use_conadjust: bool = True):
     maybe_conadjust = ContrastAdjustment2d(4, 2) if use_conadjust else nn.Identity
     encoder2d = nn.Sequential(
@@ -251,7 +251,7 @@ def conv232_assembly(n_chan: int, batch_size: int, use_norm: bool = True, leapin
         ResLayer2d(n_chan, resampling=0, use_norm=use_norm),
         nn.Conv2d(n_chan, 4, kernel_size=t2(3), padding=1, bias=True)
     )
-    model = Conv232d(batch_size, encoder2d, bottleneck3d, decoder2d, leaping_dim=leaping_dim)
+    model = Conv232d(spatial_size, encoder2d, bottleneck3d, decoder2d, leaping_dim=leaping_dim)
     return model
 
 
@@ -264,7 +264,7 @@ if __name__ == "__main__":
     print(tmp_in.shape)
     print(tmp_out.shape)
 
-    tmp_model = conv232_assembly(n_chan=3, batch_size=2)
+    tmp_model = conv232_assembly(n_chan=3, spatial_size=128)
     op2 = tmp_model(tmp_in)
     print(op2.shape)
 

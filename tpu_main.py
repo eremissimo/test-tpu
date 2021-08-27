@@ -149,7 +149,7 @@ if __name__ == "__main__":
     config = args.__dict__
 
     # WRAPPED_MODEL = xmp.MpModelWrapper(SImple(n_chan=config["base_channels"], use_norm=config["use_batchnorm"]))
-    model = conv232_assembly(n_chan=config["base_channels"], batch_size=config["batch_size"],
+    model = conv232_assembly(n_chan=config["base_channels"], spatial_size=128,
                              use_norm=config["use_batchnorm"], leaping_dim=2, use_conadjust=True)
     WRAPPED_MODEL = xmp.MpModelWrapper(model)
     SERIAL_EXEC = xmp.MpSerialExecutor()
