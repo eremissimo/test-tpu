@@ -5,7 +5,7 @@ import torch.nn.functional as ff
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from tpu_models import SImple
+from tpu_models import SImple, conv232_assembly
 from tpu_data import download_datasets
 from tqdm import tqdm
 import torchmetrics as mtr
@@ -148,7 +148,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
     config = args.__dict__
 
-    WRAPPED_MODEL = xmp.MpModelWrapper(SImple(n_chan=config["base_channels"], use_norm=config["use_batchnorm"]))
+    model = conv232_assembly(n_chan=config["base_channels"], batch_size=config["batch_size"],
+                             use_norm=config["use_batchnorm"], leaping_dim=2, use_conadjust=True)
+    WRAPPED_MODEL = xmp.MpModelWrapper(model)
     SERIAL_EXEC = xmp.MpSerialExecutor()
 
     xmp.spawn(map_fn, args=(config,), nprocs=8, start_method='fork')
