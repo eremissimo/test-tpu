@@ -117,7 +117,7 @@ def get_ce_weights(seg_t: torch.Tensor) -> torch.Tensor:
     """ Normalization coefficients for CE loss """
     # torch.bincount is not supported by xla unfortunately
     counts = torch.stack([(seg_t == i).sum() for i in range(N_CLASSES)])
-    weights = torch.where(counts > 0, 1.0/counts, torch.zeros(1))
+    weights = torch.where(counts > 0, 1.0/counts, torch.zeros(1, device=counts.device))
     weights = N_CLASSES*weights/weights.sum()
     return weights
 
@@ -148,6 +148,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     config = args.__dict__
 
+    # WRAPPED_MODEL = xmp.MpModelWrapper(SImple(n_chan=config["base_channels"], use_norm=config["use_batchnorm"]))
     model = conv232_assembly(n_chan=config["base_channels"], batch_size=config["batch_size"],
                              use_norm=config["use_batchnorm"], leaping_dim=2, use_conadjust=True)
     WRAPPED_MODEL = xmp.MpModelWrapper(model)
