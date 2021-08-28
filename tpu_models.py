@@ -8,20 +8,11 @@ def t3(val):
     return val, val, val
 
 
-class Resample(nn.Module):
-    def __init__(self, scale_factor=1):
-        super().__init__()
-        self.scale_factor = scale_factor
-
-    def forward(self, x):
-        return x if (self.scale_factor == 1) else ff.interpolate(x, scale_factor=self.scale_factor)
-
-
 class ResLayer(nn.Module):
     """ ResNet IDLayer for shallow query, key, value nets """
-    def __init__(self, in_channels, kernel_size=3, resampling=0, use_norm=True):
+    def __init__(self, in_channels, out_channels=None, kernel_size=3, resampling=0, use_norm=True):
         super().__init__()
-        mid_channels = int(in_channels / (2**resampling))
+        mid_channels = out_channels if out_channels is not None else int(in_channels / (2**resampling))
         stride = 1 if resampling == 0 else 2
         padd = t3(get_padding(kernel_size, stride=stride, dilation=1))
         # for convtranspose:
@@ -54,16 +45,15 @@ class ResLayer(nn.Module):
                                                   bias=False)
         self.relu = nn.ReLU(inplace=True)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         op = self.main_branch(x) + self.skip_branch(x)
         op = self.relu(op)
         return op
 
 
-class SImple(nn.Module):
+class SImple(nn.Sequential):
     def __init__(self, n_chan, use_norm=True):
-        super().__init__()
-        self.net = nn.Sequential(
+        super().__init__(
             nn.Conv3d(4, n_chan, kernel_size=t3(3), padding=1, bias=True),
             nn.ReLU(inplace=True),
             ResLayer(n_chan, resampling=0, use_norm=use_norm),
@@ -73,16 +63,52 @@ class SImple(nn.Module):
             ResLayer(4*n_chan, resampling=1, use_norm=use_norm),
             ResLayer(2*n_chan, resampling=1, use_norm=use_norm),
             ResLayer(n_chan, resampling=0, use_norm=use_norm),
-            nn.Conv3d(n_chan, 4, kernel_size=t3(3), padding=1, bias=False)
+            nn.Conv3d(n_chan, 4, kernel_size=t3(3), padding=1, bias=True)
         )
 
-    def forward(self, x):
-        return self.net(x)
+
+class SImpleUnet(nn.Module):
+    def __init__(self, n_chan: int, kernel_size: int = 3, use_norm: bool = True, skip_conn_op: str = 'cat'):
+        super().__init__()
+        self.proj_in = nn.Sequential(
+            nn.Conv3d(4, n_chan, kernel_size=t3(kernel_size), padding=1, bias=True),
+            nn.ReLU(inplace=True)
+        )
+        if skip_conn_op == 'cat':
+            self.skip_conn_func = torch.add
+            skip_chan_mult = 1
+        elif skip_conn_op == 'sum':
+            self.skip_conn_func = lambda x, y: torch.cat((x, y), dim=1)
+            skip_chan_mult = 2
+        else:
+            raise ValueError("Just use skip_conn_op = 'cat' or 'sum'")
+        self.d0 = ResLayer(n_chan, resampling=0, kernel_size=kernel_size, use_norm=use_norm)
+        self.d2 = ResLayer(n_chan, resampling=-1, kernel_size=kernel_size, use_norm=use_norm)
+        self.d4 = ResLayer(2*n_chan, resampling=-1, kernel_size=kernel_size, use_norm=use_norm)
+        self.bottleneck = ResLayer(4*n_chan, resampling=0, kernel_size=kernel_size, use_norm=use_norm)
+        self.u4 = ResLayer(skip_chan_mult*4*n_chan, 2*n_chan, kernel_size=kernel_size, resampling=1, use_norm=use_norm)
+        self.u2 = ResLayer(skip_chan_mult*2*n_chan, n_chan, kernel_size=kernel_size, resampling=1, use_norm=use_norm)
+        self.u0 = ResLayer(skip_chan_mult*n_chan, n_chan, kernel_size=kernel_size, resampling=0, use_norm=use_norm)
+        self.proj_out = nn.Conv3d(n_chan, 4, kernel_size=t3(kernel_size), padding=kernel_size//2, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x0 = self.d0(self.proj_in(x))
+        x2 = self.d2(x0)
+        x4 = self.d4(x2)
+        x4 = self.skip_conn_func(x4, self.bottleneck(x4))
+        x2 = self.skip_conn_func(x2, self.u4(x4))
+        x0 = self.skip_conn_func(x0, self.u2(x2))
+        x0 = self.proj_out(self.u0(x0))
+        return x0
 
 
 if __name__ == "__main__":
     tmp_in = torch.randn((2, 4, 64, 64, 32))
     tmp_out = SImple(8)(tmp_in)
+    print(tmp_in.shape)
+    print(tmp_out.shape)
+
+    tmp_out = SImpleUnet(8)(tmp_in)
     print(tmp_in.shape)
     print(tmp_out.shape)
 
