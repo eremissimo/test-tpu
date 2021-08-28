@@ -116,8 +116,8 @@ def reduce_dict(tag: str, x: dict):
 def get_ce_weights(seg_t: torch.Tensor) -> torch.Tensor:
     """ Normalization coefficients for CE loss """
     # torch.bincount is not supported by xla unfortunately
-    counts = torch.stack([(seg_t == i).sum() for i in range(N_CLASSES)])
-    weights = torch.where(counts > 0, 1.0/counts, torch.zeros(1, device=counts.device))
+    counts = torch.stack([(seg_t == i).sum() for i in range(N_CLASSES)]).float()
+    weights = torch.where(counts > 0., 1.0/counts, torch.zeros((1,), device=counts.device))
     weights = N_CLASSES*weights/weights.sum()
     return weights
 
