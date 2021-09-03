@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as ff
 from padding import get_padding
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 
 
 """    #############################    """
@@ -85,6 +86,86 @@ class ResLayer3d(ResLayer):
     def __init__(self, in_channels: int, out_channels: Optional[int] = None, kernel_size: int = 3, resampling: int = 0,
                  use_norm: bool = True):
         super().__init__(in_channels, out_channels, kernel_size, resampling, use_norm, ndim=3)
+
+
+class UpsampleNd(nn.Module):
+    """ Upsample as ConvTranspose with certain kernels. Interpolation is not supported by xla yet, that's why the
+        native nn.Upsample is slow on TPU.
+        Only natural scale factors are supported."""
+    def __init__(self, in_channels: int, scale: int = 2, mode: str = "nearest", nd: int = 2):
+        super().__init__()
+        assert isinstance(scale, int)
+        self.scale = scale
+        if mode == "nearest":
+            kernel_base1d = self._kernel_base_nearest(scale)
+            self.padding = (2*scale - 1)//2
+            self.outpadding = scale-1
+        elif mode in {"linear", "bilinear", "trilinear"}:
+            kernel_base1d = self._kernel_base_linear(scale)
+            self.padding = scale // 2
+            self.outpadding = 0
+        else:
+            raise ValueError(" Unexpected mode argument. Try using 'nearest' or 'linear'. ")
+        kernel_tensor = self._construct_kernel(in_channels, kernel_base1d, nd)
+        self.register_buffer("kernel", kernel_tensor, persistent=False)
+        self.conv = [ff.conv_transpose1d, ff.conv_transpose2d, ff.conv_transpose3d][nd-1]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x, self.kernel, padding=self.padding, stride=self.scale, output_padding=self.outpadding)
+
+    @staticmethod
+    def _construct_kernel(in_channels: int, kernel_base1d: torch.Tensor, nd: int) -> torch.Tensor:
+        kernel_size = len(kernel_base1d)
+        # a disgusting substitute of "tensor.unsqueeze(-1).unsqueeze(-1)... n-1 times" syntax
+        kernel_base1d = kernel_base1d[(...,) + (None,)*(nd-1)]
+        kernel_base = kernel_base1d
+        for i in range(1, nd):
+            kernel_base = kernel_base * kernel_base1d.transpose(0, i)
+        kernel = torch.zeros((in_channels,)*2 + (kernel_size,)*nd, dtype=torch.float32)
+        for i in range(in_channels):
+            kernel[i, i, ...] = kernel_base
+        return kernel
+
+    @staticmethod
+    def _kernel_base_linear(scale: int) -> torch.Tensor:
+        # The following kernel provides preservation of input points in the rescaled output but leaves one-sided border
+        # artifacts.
+        # palindrome = (torch.cat([torch.arange(1, scale+1), torch.arange(scale-1, 0, -1)]).float()) / scale
+
+        # application of kernels below are meant to replace
+        # nn.Upsample(scale_factor=scale, mode='bilinear', align_corners=False), as they provide identical internal
+        # tensor elements.
+        # The difference between ConvTranspose with these kernels and nn.Upsample lies in conv's zero padding. I guess,
+        # if pytorch somehow supported 'reflect' padding for ConvTranspose, results at the borders would be identical
+        # aswell.
+        # Anyway, this implementation seems legit to me.
+        if scale % 2 == 0:
+            palindrome = torch.cat((torch.arange(1, scale*2, 2), torch.arange(2*scale-1, 0, -2))).float()
+        else:
+            palindrome = torch.cat((torch.arange(2, scale*2+1, 2), torch.arange(2*scale-2, 0, -2))).float()
+        palindrome /= (2*scale)
+        return palindrome
+
+    @staticmethod
+    def _kernel_base_nearest(scale: int):
+        kbn = torch.zeros(2*scale-1)
+        kbn[(scale-1):] = 1.
+        return kbn
+
+
+class Upsample1d(UpsampleNd):
+    def __init__(self, in_channels: int, scale: int = 2, mode: str = "nearest"):
+        super().__init__(in_channels, scale, mode, nd=1)
+
+
+class Upsample2d(UpsampleNd):
+    def __init__(self, in_channels: int, scale: int = 2, mode: str = "nearest"):
+        super().__init__(in_channels, scale, mode, nd=2)
+
+
+class Upsample3d(UpsampleNd):
+    def __init__(self, in_channels: int, scale: int = 2, mode: str = "nearest"):
+        super().__init__(in_channels, scale, mode, nd=3)
 
 
 class To2d(nn.Module):
@@ -198,6 +279,7 @@ class SImple(nn.Sequential):
 
 
 class Conv232d(nn.Sequential):
+    """ A simple encoder-decoder with 2d-3d-2d convolutions """
     def __init__(self, spatial_size: int, encoder2d: nn.Module, bottleneck3d: nn.Module, decoder2d: nn.Module,
                  leaping_dim: int = 2):
         super().__init__(
@@ -209,49 +291,6 @@ class Conv232d(nn.Sequential):
             decoder2d,
             To3d(spatial_size, dim_from_batch=leaping_dim)
         )
-
-
-class Conv323Unet(nn.Module):
-    def __init__(self, n_chan: int, spatial_size: int, kernel_size: int = 3, use_norm: bool = True,
-                 leaping_dim: int = 2, skip_conn_op: str = 'cat'):
-        super().__init__()
-        if skip_conn_op == 'cat':
-            self.skip_conn_func = torch.add
-            skip_chan_mult = 1
-        elif skip_conn_op == 'sum':
-            self.skip_conn_func = lambda x, y: torch.cat((x, y), dim=1)
-            skip_chan_mult = 2
-        else:
-            raise ValueError("Only 'cat' or 'sum' are available as skip_conn_op argument")
-        self.to2d = To2d(dim_to_batch=leaping_dim)
-        self.to3d = To3d(spatial_size, dim_from_batch=leaping_dim)
-        self.proj_in = nn.Sequential(
-            nn.Conv2d(4, n_chan, kernel_size=t2(kernel_size), padding=1, bias=True),
-            nn.ReLU(inplace=True),
-        )
-        self.d0 = ResLayer2d(n_chan, kernel_size=kernel_size, resampling=0, use_norm=use_norm)
-        self.d2 = ResLayer2d(n_chan, kernel_size=kernel_size, resampling=-1, use_norm=use_norm)
-        self.d4 = ResLayer2d(2*n_chan, kernel_size=kernel_size, resampling=-1, use_norm=use_norm)
-        self.bottleneck3d = construct_bottleneck3d(n_chan, use_norm, leaping_dim)
-        self.u4 = ResLayer2d(skip_chan_mult*4*n_chan, 2*n_chan, kernel_size=kernel_size, resampling=1,
-                             use_norm=use_norm)
-        self.u2 = ResLayer2d(skip_chan_mult*2*n_chan, n_chan, kernel_size=kernel_size, resampling=1,
-                             use_norm=use_norm)
-        self.u0 = ResLayer2d(skip_chan_mult*n_chan, n_chan, kernel_size=kernel_size, resampling=0,
-                             use_norm=use_norm)
-        self.proj_out = nn.Conv2d(n_chan, 4, kernel_size=t2(kernel_size), padding=kernel_size//2, bias=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x0 = self.d0(self.proj_in(self.to2d(x)))
-        x2 = self.d2(x0)
-        x4 = self.d4(x2)
-        x4 = self.to3d(x4)
-        x4 = self.skip_conn_func(x4, self.bottleneck3d(x4))
-        x4 = self.to2d(x4)
-        x2 = self.skip_conn_func(x2, self.u4(x4))
-        x0 = self.skip_conn_func(x0, self.u2(x2))
-        x0 = self.to3d(self.proj_out(self.u0(x0)))
-        return x0
 
 
 def _t31(k: int, i: int, defval: int = 1) -> Tuple[int, ...]:
@@ -306,20 +345,170 @@ def conv232_assembly(n_chan: int, spatial_size: int, use_norm: bool = True, leap
     return model
 
 
+"""    #################################    """
+"""    #          Conv232 Unet         #    """
+"""    #################################    """
+
+
+class Conv232Unet(nn.Module):
+    def __init__(self, n_chan: int, spatial_size: int, kernel_size: int = 3, use_norm: bool = True,
+                 leaping_dim: int = 2, skip_conn_op: str = 'cat'):
+        super().__init__()
+        if skip_conn_op == 'cat':
+            self.skip_conn_func = torch.add
+            skip_chan_mult = 1
+        elif skip_conn_op == 'sum':
+            self.skip_conn_func = lambda x, y: torch.cat((x, y), dim=1)
+            skip_chan_mult = 2
+        else:
+            raise ValueError("Only 'cat' or 'sum' are available as skip_conn_op argument")
+        self.to2d = To2d(dim_to_batch=leaping_dim)
+        self.to3d = To3d(spatial_size, dim_from_batch=leaping_dim)
+        self.proj_in = nn.Sequential(
+            nn.Conv2d(4, n_chan, kernel_size=t2(kernel_size), padding=kernel_size//2, bias=True),
+            nn.ReLU(inplace=True),
+        )
+        self.d0 = ResLayer2d(n_chan, kernel_size=kernel_size, resampling=0, use_norm=use_norm)
+        self.d2 = ResLayer2d(n_chan, kernel_size=kernel_size, resampling=-1, use_norm=use_norm)
+        self.d4 = ResLayer2d(2*n_chan, kernel_size=kernel_size, resampling=-1, use_norm=use_norm)
+        self.bottleneck3d = construct_bottleneck3d(n_chan, use_norm, leaping_dim)
+        self.u4 = ResLayer2d(skip_chan_mult*4*n_chan, 2*n_chan, kernel_size=kernel_size, resampling=1,
+                             use_norm=use_norm)
+        self.u2 = ResLayer2d(skip_chan_mult*2*n_chan, n_chan, kernel_size=kernel_size, resampling=1,
+                             use_norm=use_norm)
+        self.u0 = ResLayer2d(skip_chan_mult*n_chan, n_chan, kernel_size=kernel_size, resampling=0,
+                             use_norm=use_norm)
+        self.proj_out = nn.Conv2d(n_chan, 4, kernel_size=t2(kernel_size), padding=kernel_size//2, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x0 = self.d0(self.proj_in(self.to2d(x)))
+        x2 = self.d2(x0)
+        x4 = self.d4(x2)
+        x4 = self.to3d(x4)
+        x4 = self.skip_conn_func(x4, self.bottleneck3d(x4))
+        x4 = self.to2d(x4)
+        x2 = self.skip_conn_func(x2, self.u4(x4))
+        x0 = self.skip_conn_func(x0, self.u2(x2))
+        x0 = self.to3d(self.proj_out(self.u0(x0)))
+        return x0
+
+
+"""    ######################################    """
+"""    #          Conv232 RefineNet         #    """
+"""    ######################################    """
+
+
+class RCU2d(nn.Module):
+    def __init__(self, in_chan: int, mid_chan: Optional[int] = None, kernel_size: int = 3, n_blocks: int = 2):
+        super().__init__()
+        if mid_chan is None:
+            mid_chan = in_chan
+        self.n_blocks = n_blocks
+        self.conv1list = nn.ModuleList(nn.Conv2d(in_chan, mid_chan, kernel_size=t2(kernel_size), padding=kernel_size//2)
+                                       for _ in range(n_blocks))
+        self.conv2list = nn.ModuleList(nn.Conv2d(mid_chan, in_chan, kernel_size=t2(kernel_size), padding=kernel_size//2)
+                                       for _ in range(n_blocks))
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for conv1, conv2 in zip(self.conv1list, self.conv2list):
+            x += self.relu(conv2(self.relu(conv1(x))))
+        return x
+
+
+class MultiResolutionFusion(nn.Module):
+    def __init__(self, in_chans: List[int], out_chan: int, scale_factors: List[int], upsample_mode="nearest"):
+        super().__init__()
+        self.upsamples = nn.ModuleList(nn.Identity() if sf == 1 else Upsample2d(out_chan, scale=sf, mode=upsample_mode)
+                                       for sf in scale_factors)
+        self.convs = nn.ModuleList(nn.Conv2d(inch, out_chan, kernel_size=t2(3), padding=1, bias=True)
+                                   for inch in in_chans)
+
+    def forward(self, multiscale_imgs: Tuple[torch.Tensor, ...]) -> torch.Tensor:
+        return sum(upsample(conv(img)) for upsample, conv, img in zip(self.upsamples, self.convs, multiscale_imgs))
+
+
+class Conv232RefineNet(nn.Module):
+    def __init__(self, n_chan: int, spatial_size: int, kernel_size: int = 3, use_norm: bool = True,
+                 leaping_dim: int = 2):
+        super().__init__()
+        self.to2d = To2d(dim_to_batch=leaping_dim)
+        self.to3d = To3d(spatial_size, dim_from_batch=leaping_dim)
+        self.proj_in = nn.Sequential(
+            nn.Conv2d(4, n_chan, kernel_size=t2(kernel_size), padding=kernel_size//2, bias=True),
+            nn.ReLU(inplace=True),
+        )
+        self.d0 = ResLayer2d(n_chan, kernel_size=kernel_size, resampling=0, use_norm=use_norm)
+        self.d2 = ResLayer2d(n_chan, kernel_size=kernel_size, resampling=-1, use_norm=use_norm)
+        self.d4 = ResLayer2d(2*n_chan, kernel_size=kernel_size, resampling=-1, use_norm=use_norm)
+        self.bottleneck3d = construct_bottleneck3d(n_chan, use_norm, leaping_dim)
+        self.rcu0 = RCU2d(n_chan, n_blocks=2)
+        self.rcu2 = RCU2d(2*n_chan, n_blocks=2)
+        self.rcu4 = RCU2d(4*n_chan, n_blocks=2)
+        self.merge = MultiResolutionFusion(in_chans=[n_chan, 2*n_chan, 4*n_chan], out_chan=n_chan,
+                                           scale_factors=[1, 2, 4], upsample_mode="nearest")
+        self.u0 = ResLayer2d(n_chan, kernel_size=kernel_size, resampling=0, use_norm=use_norm)
+        self.proj_out = nn.Conv2d(n_chan, 4, kernel_size=t2(kernel_size), padding=kernel_size//2, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x0 = self.d0(self.proj_in(self.to2d(x)))
+        x2 = self.d2(x0)
+        x4 = self.d4(x2)
+        x4 = self.to3d(x4)
+        x4 = x4 + self.bottleneck3d(x4)
+        x4 = self.to2d(x4)
+        x0 = self.merge((x0, x2, x4))
+        x0 = self.to3d(self.proj_out(self.u0(x0)))
+        return x0
+
+
+class Conv232RefineNetCascade(Conv232RefineNet):
+    def __init__(self, n_chan: int, spatial_size: int, kernel_size: int = 3, use_norm: bool = True,
+                 leaping_dim: int = 2):
+        super().__init__(n_chan, spatial_size, kernel_size, use_norm, leaping_dim)
+        self.u2 = ResLayer2d(2*n_chan, kernel_size=kernel_size, resampling=0, use_norm=use_norm)
+        self.u0 = ResLayer2d(n_chan, kernel_size=kernel_size, resampling=0, use_norm=use_norm)
+        self.merge = MultiResolutionFusion(in_chans=[n_chan, 2*n_chan], out_chan=n_chan,
+                                           scale_factors=[1, 2], upsample_mode="nearest")
+        self.merge2 = MultiResolutionFusion(in_chans=[2*n_chan, 4*n_chan], out_chan=2*n_chan,
+                                            scale_factors=[1, 2], upsample_mode="nearest")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x0 = self.d0(self.proj_in(self.to2d(x)))
+        x2 = self.d2(x0)
+        x4 = self.d4(x2)
+        x4 = self.to3d(x4)
+        x4 = x4 + self.bottleneck3d(x4)
+        x4 = self.to2d(x4)
+        x2 = self.merge2((x2, x4))
+        x2 = self.u2(x2)
+        x0 = self.merge((x0, x2))
+        x0 = self.to3d(self.proj_out(self.u0(x0)))
+        return x0
+
+
 """    #############################    """
 
 
 if __name__ == "__main__":
+
     tmp_in = torch.randn((2, 4, 128, 128, 80))
-    tmp_out = SImple(8)(tmp_in)
-    print(tmp_in.shape)
-    print(tmp_out.shape)
+    op2 = SImple(8)(tmp_in)
+    print(op2.shape)
 
     tmp_model = conv232_assembly(n_chan=3, spatial_size=128)
     op2 = tmp_model(tmp_in)
     print(op2.shape)
 
-    tmp_model = Conv323Unet(n_chan=3, spatial_size=128)
+    tmp_model = Conv232Unet(n_chan=3, spatial_size=128)
+    op2 = tmp_model(tmp_in)
+    print(op2.shape)
+
+    tmp_model = Conv232RefineNet(n_chan=3, spatial_size=128)
+    op2 = tmp_model(tmp_in)
+    print(op2.shape)
+
+    tmp_model = Conv232RefineNetCascade(n_chan=3, spatial_size=128)
     op2 = tmp_model(tmp_in)
     print(op2.shape)
 
