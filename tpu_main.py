@@ -49,8 +49,8 @@ def map_fn(index: int, config: dict) -> None:
     # 3. MODELS & METRICS
     model = WRAPPED_MODEL.to(device)
     model.train()
-    per_parameter_optimizer_options = [{"param": model.contr_adjust.parameters(), "weight_decay": 0.0},
-                                       {"param": itertools.chain.from_iterable(sub.parameters() for sub in
+    per_parameter_optimizer_options = [{"params": model.contr_adjust.parameters(), "weight_decay": 0.0},
+                                       {"params": itertools.chain.from_iterable(sub.parameters() for sub in
                                                                                model.children() if sub is not
                                                                                model.contr_adjust),
                                         "weight_decay": config["l2reg"]}]
@@ -81,9 +81,9 @@ def map_fn(index: int, config: dict) -> None:
             loss = ff.cross_entropy(logits, seg_t, weight=get_ce_weights(seg_t))
             loss.backward()
             xm.optimizer_step(optimizer)
-            lr_scheduler.step()
             train_avg_loss += loss.detach()
-
+        lr_scheduler.step()
+        
         # 5.2 validation loop
         model.eval()
         val_avg_loss.zero_()
