@@ -33,8 +33,12 @@ def download_datasets(config: dict, data_path: str) -> Tuple[Dataset, Dataset]:
             print("test.pt is found in the data folder. Skipping download phase ... ")
         else:
             load_from_bucket(config["bucket"], val_path)
-        train_data_tensors: Tuple[torch.Tensor, torch.Tensor] = torch.load(train_path)  # img, target_segmentation
-        val_data_tensors: Tuple[torch.Tensor, torch.Tensor] = torch.load(val_path)
+        train_data_tensors: Tuple[torch.Tensor, ...] = torch.load(train_path)  # img, target_segmentation
+        val_data_tensors: Tuple[torch.Tensor, ...] = torch.load(val_path)
+        train_data_tensors = tuple(ff.pad(x, [0, 0, 4, 4, 4, 4]) for x in train_data_tensors)
+        val_data_tensors = tuple(ff.pad(x, [0, 0, 4, 4, 4, 4]) for x in val_data_tensors)
+        gc.collect()
+
     print("Instantiating dataset classes...  ", end="")
 
     transform = Compose([random_x_flip_tuple, to_float32_int64])

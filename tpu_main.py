@@ -5,10 +5,11 @@ import torch.nn.functional as ff
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from tpu_models import SImple, ContrNet
+from tpu_models import SImple, conv232_assembly
 from tpu_data import download_datasets
 from tqdm import tqdm
 import torchmetrics as mtr
+from torchmetrics.classification.iou import IoU
 
 # os.environ["XLA_USE_BF16"] = 1
 
@@ -50,7 +51,9 @@ def map_fn(index: int, config: dict) -> None:
     optimizer = optim.Adam(model.parameters(), lr=config["lr"])
     lr_scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=config["lr_gamma"])
     val_metrics = mtr.MetricCollection({"acc": mtr.Accuracy(compute_on_step=False),
-                                        "tacc": mtr.Accuracy(compute_on_step=False, ignore_index=0)},
+                                        "tacc": mtr.Accuracy(compute_on_step=False, ignore_index=0),
+                                        "iou": IoU(num_classes=N_CLASSES, ignore_index=0, reduction='none',
+                                                   compute_on_step=False)},
                                        prefix="Valid/").to(device)
     class_weights = torch.tensor([0.0028, 2.2711, 0.5229, 1.2033], device=device)   # precomputed from entire dataset
 
@@ -113,8 +116,8 @@ def reduce_dict(tag: str, x: dict):
 def get_ce_weights(seg_t: torch.Tensor) -> torch.Tensor:
     """ Normalization coefficients for CE loss """
     # torch.bincount is not supported by xla unfortunately
-    counts = torch.stack([(seg_t == i).sum() for i in range(N_CLASSES)])
-    weights = 1.0/counts
+    counts = torch.stack([(seg_t == i).sum() for i in range(N_CLASSES)]).float()
+    weights = torch.where(counts > 0., 1.0/counts, torch.zeros((1,), device=counts.device))
     weights = N_CLASSES*weights/weights.sum()
     return weights
 
@@ -145,8 +148,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
     config = args.__dict__
 
-    WRAPPED_MODEL = xmp.MpModelWrapper(ContrNet(n_chan=config["base_channels"], kernel_size=3, use_norm=config["use_batchnorm"]))
-    # WRAPPED_MODEL = xmp.MpModelWrapper(SImpleDirac(n_chan=config["base_channels"]))
+    # WRAPPED_MODEL = xmp.MpModelWrapper(SImple(n_chan=config["base_channels"], use_norm=config["use_batchnorm"]))
+    model = conv232_assembly(n_chan=config["base_channels"], spatial_size=128,
+                             use_norm=config["use_batchnorm"], leaping_dim=2, use_conadjust=True)
+    WRAPPED_MODEL = xmp.MpModelWrapper(model)
     SERIAL_EXEC = xmp.MpSerialExecutor()
 
     xmp.spawn(map_fn, args=(config,), nprocs=8, start_method='fork')
