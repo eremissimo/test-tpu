@@ -241,21 +241,14 @@ class ContrastAdjustment(nn.Module):
     """
     def __init__(self, n_chan: int,  num_terms: int = 2, nd: int = 3):
         super().__init__()
-        # [terms, B, chan, X, Y, Z] broadcasting scheme
+        # [terms, B, chan, X, Y, Z] broadcasting scheme (for 3d)
         shp = [num_terms, 1, n_chan] + [1]*nd
         self.amplitudes = nn.Parameter(0.032*torch.randn(shp), requires_grad=True)
-        self.means = nn.Parameter(torch.rand(shp), requires_grad=True)
+        self.means = nn.Parameter(2*torch.rand(shp), requires_grad=True)
         self.stds = nn.Parameter(0.25*torch.ones(shp, dtype=torch.float32), requires_grad=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # scaling input tensor to [0,1]
-        mx = torch.max(x)
-        mn = torch.min(x)
-        op = (x - mn)/(mx - mn)
-        # applying transform
-        op = op + (self.amplitudes*torch.exp(-0.5*((op - self.means)/self.stds).square())).sum(dim=0)
-        # rescaling back
-        op = mn + op*(mx - mn)
+        op = x*(1 + (self.amplitudes*torch.exp(-0.5*((x - self.means)/self.stds).square())).sum(dim=0))
         return op
 
 
@@ -395,6 +388,7 @@ class Conv232Unet(nn.Module):
             raise ValueError("Only 'cat' or 'sum' are available as skip_conn_op argument")
         self.to2d = To2d(dim_to_batch=leaping_dim)
         self.to3d = To3d(spatial_size, dim_from_batch=leaping_dim)
+        self.contr_adjust = ContrastAdjustment2d(4, num_terms=6)
         self.proj_in = nn.Sequential(
             nn.Conv2d(4, n_chan, kernel_size=t2(kernel_size), padding=kernel_size//2, bias=True),
             nn.ReLU(inplace=True),
@@ -404,15 +398,15 @@ class Conv232Unet(nn.Module):
         self.d4 = MultiResLayer2d(2*n_chan, kernel_size=kernel_size, resampling=-1, use_norm=use_norm)
         self.bottleneck3d = construct_bottleneck3d(n_chan, use_norm, leaping_dim)
         self.u4 = MultiResLayer2d(skip_chan_mult*4*n_chan, 2*n_chan, kernel_size=kernel_size, resampling=1,
-                             use_norm=use_norm)
+                                  use_norm=use_norm)
         self.u2 = MultiResLayer2d(skip_chan_mult*2*n_chan, n_chan, kernel_size=kernel_size, resampling=1,
-                             use_norm=use_norm)
+                                  use_norm=use_norm)
         self.u0 = MultiResLayer2d(skip_chan_mult*n_chan, n_chan, kernel_size=kernel_size, resampling=0,
-                             use_norm=use_norm)
+                                  use_norm=use_norm)
         self.proj_out = nn.Conv2d(n_chan, 4, kernel_size=t2(kernel_size), padding=kernel_size//2, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x0 = self.d0(self.proj_in(self.to2d(x)))
+        x0 = self.d0(self.proj_in(self.contr_adjust(self.to2d(x))))
         x2 = self.d2(x0)
         x4 = self.d4(x2)
         x4 = self.to3d(x4)
@@ -465,6 +459,7 @@ class Conv232RefineNet(nn.Module):
         super().__init__()
         self.to2d = To2d(dim_to_batch=leaping_dim)
         self.to3d = To3d(spatial_size, dim_from_batch=leaping_dim)
+        self.contr_adjust = ContrastAdjustment2d(4, num_terms=6)
         self.proj_in = nn.Sequential(
             nn.Conv2d(4, n_chan, kernel_size=t2(kernel_size), padding=kernel_size//2, bias=True),
             nn.ReLU(inplace=True),
@@ -482,7 +477,7 @@ class Conv232RefineNet(nn.Module):
         self.proj_out = nn.Conv2d(n_chan, 4, kernel_size=t2(kernel_size), padding=kernel_size//2, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x0 = self.d0(self.proj_in(self.to2d(x)))
+        x0 = self.d0(self.proj_in(self.contr_adjust(self.to2d(x))))
         x2 = self.d2(x0)
         x4 = self.d4(x2)
         x4 = self.to3d(x4)
@@ -497,6 +492,7 @@ class Conv232RefineNetCascade(Conv232RefineNet):
     def __init__(self, n_chan: int, spatial_size: int, kernel_size: int = 3, use_norm: bool = True,
                  leaping_dim: int = 2):
         super().__init__(n_chan, spatial_size, kernel_size, use_norm, leaping_dim)
+        self.contr_adjust = ContrastAdjustment2d(4, num_terms=6)
         self.u2 = MultiResLayer2d(2*n_chan, kernel_size=kernel_size, resampling=0, use_norm=use_norm)
         self.u0 = MultiResLayer2d(n_chan, kernel_size=kernel_size, resampling=0, use_norm=use_norm)
         self.merge = MultiResolutionFusion(in_chans=[n_chan, 2*n_chan], out_chan=n_chan,
@@ -505,7 +501,7 @@ class Conv232RefineNetCascade(Conv232RefineNet):
                                             scale_factors=[1, 2], upsample_mode="nearest")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x0 = self.d0(self.proj_in(self.to2d(x)))
+        x0 = self.d0(self.proj_in(self.contr_adjust(self.to2d(x))))
         x2 = self.d2(x0)
         x4 = self.d4(x2)
         x4 = self.to3d(x4)
