@@ -1,4 +1,5 @@
 import os
+import itertools
 from argparse import ArgumentParser
 import torch
 import torch.nn.functional as ff
@@ -48,7 +49,12 @@ def map_fn(index: int, config: dict) -> None:
     # 3. MODELS & METRICS
     model = WRAPPED_MODEL.to(device)
     model.train()
-    optimizer = optim.Adam(model.parameters(), lr=config["lr"])
+    per_parameter_optimizer_options = [{"param": model.contr_adjust.parameters(), "weight_decay": 0.0},
+                                       {"param": itertools.chain.from_iterable(sub.parameters() for sub in
+                                                                               model.children() if sub is not
+                                                                               model.contr_adjust),
+                                        "weight_decay": config["l2reg"]}]
+    optimizer = optim.Adam(per_parameter_optimizer_options, lr=config["lr"])
     lr_scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=config["lr_gamma"])
     val_metrics = mtr.MetricCollection({"acc": mtr.Accuracy(compute_on_step=False),
                                         "tacc": mtr.Accuracy(compute_on_step=False, ignore_index=0),
