@@ -6,6 +6,22 @@ from typing import Tuple, Optional, List
 
 
 """    #############################    """
+"""    #          Losses           #    """
+"""    #############################    """
+
+
+def focal_loss(input: torch.Tensor, target: torch.Tensor, weight: Optional[torch.Tensor] = None,
+               gamma: float = 1.0) -> torch.Tensor:
+    ce = ff.cross_entropy(input, target, reduction="none")
+    probs = torch.exp(-ce)
+    loss = ((1 - probs).pow(gamma))*ce
+    if weight is not None:
+        loss *= weight[target]
+    loss_reduced = loss.mean()
+    return loss_reduced
+
+
+"""    #############################    """
 """    #          Layers           #    """
 """    #############################    """
 

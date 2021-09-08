@@ -6,7 +6,7 @@ import torch.nn.functional as ff
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from tpu_models import SImple, Conv232Unet, Conv232RefineNet, Conv232RefineNetCascade
+from tpu_models import focal_loss, SImple, Conv232Unet, Conv232RefineNet, Conv232RefineNetCascade
 from tpu_data import download_datasets
 from tqdm import tqdm
 import torchmetrics as mtr
@@ -78,19 +78,19 @@ def map_fn(index: int, config: dict) -> None:
         for img, seg_t in train_loader_with_tqdm:
             optimizer.zero_grad()
             logits = model(img)
-            loss = ff.cross_entropy(logits, seg_t, weight=get_ce_weights(seg_t))
+            loss = focal_loss(logits, seg_t, weight=get_ce_weights(seg_t))
             loss.backward()
             xm.optimizer_step(optimizer)
             train_avg_loss += loss.detach()
         lr_scheduler.step()
-        
+
         # 5.2 validation loop
         model.eval()
         val_avg_loss.zero_()
         with torch.no_grad():
             for img, seg_t in val_device_loader:
                 logits = model(img)
-                loss_v = ff.cross_entropy(logits, seg_t, weight=get_ce_weights(seg_t))
+                loss_v = focal_loss(logits, seg_t, weight=get_ce_weights(seg_t))
                 val_avg_loss += loss_v
                 val_metrics.update(logits, seg_t)
 
