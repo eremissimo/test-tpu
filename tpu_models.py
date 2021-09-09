@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as ff
+from torchmetrics.functional.classification import recall
 from padding import get_padding
 from typing import Tuple, Optional, List
 
@@ -12,13 +13,36 @@ from typing import Tuple, Optional, List
 
 def focal_loss(input: torch.Tensor, target: torch.Tensor, weight: Optional[torch.Tensor] = None,
                gamma: float = 1.0) -> torch.Tensor:
+    weight = weight.nan_to_num()
+    weight /= weight.sum()
     ce = ff.cross_entropy(input, target, reduction="none")
     probs = torch.exp(-ce)
     loss = ((1 - probs).pow(gamma))*ce
     if weight is not None:
         loss *= weight[target]
-    loss_reduced = loss.mean()
+    loss_reduced = loss.mean(dim=0).sum()
     return loss_reduced
+
+
+def recall_ce_loss(input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """From the unpublished article "Recall Loss for Imbalanced Image Classification and Semantic Segmentation" """
+    batch_recall = recall(input, target, average='none', num_classes=input.shape[1], mdmc_average='global')
+    weight = 1.0 - batch_recall.nan_to_num(nan=1., posinf=1., neginf=1.)
+    return ff.cross_entropy(input, target, weight=weight)
+
+
+def soft_iou_loss(input: torch.Tensor, target: torch.Tensor, weight: Optional[torch.Tensor] = None) -> torch.Tensor:
+    probs = input.softmax(dim=1)
+    targ_probs = ff.one_hot(target, num_classes=input.shape[1]).permute([0, 4, 1, 2, 3])
+    intersection = (probs * targ_probs).sum(dim=[2, 3, 4])
+    union = (probs + targ_probs - probs * targ_probs).sum(dim=[2, 3, 4])
+    iou = intersection/union
+    if weight is not None:
+        weight = weight.nan_to_num(nan=0., posinf=0., neginf=0.)
+        weight /= weight.sum()
+        iou *= (weight.unsqueeze(0))
+    return iou.mean()
+
 
 
 """    #############################    """

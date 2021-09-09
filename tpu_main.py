@@ -6,13 +6,13 @@ import torch.nn.functional as ff
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from tpu_models import focal_loss, SImple, Conv232Unet, Conv232RefineNet, Conv232RefineNetCascade
+from tpu_models import focal_loss, recall_ce_loss, soft_iou_loss, \
+    SImple, Conv232Unet, Conv232RefineNet, Conv232RefineNetCascade
 from tpu_data import download_datasets
 from tqdm import tqdm
 import torchmetrics as mtr
-from torchmetrics.classification.iou import IoU
+from torchmetrics.classification import IoU
 
-# os.environ["XLA_USE_BF16"] = 1
 
 import torch_xla
 # import torch_xla.debug.metrics as met
@@ -78,7 +78,7 @@ def map_fn(index: int, config: dict) -> None:
         for img, seg_t in train_loader_with_tqdm:
             optimizer.zero_grad()
             logits = model(img)
-            loss = focal_loss(logits, seg_t, weight=get_ce_weights(seg_t))
+            loss = recall_ce_loss(logits, seg_t)
             loss.backward()
             xm.optimizer_step(optimizer)
             train_avg_loss += loss.detach()
@@ -90,7 +90,7 @@ def map_fn(index: int, config: dict) -> None:
         with torch.no_grad():
             for img, seg_t in val_device_loader:
                 logits = model(img)
-                loss_v = focal_loss(logits, seg_t, weight=get_ce_weights(seg_t))
+                loss_v = recall_ce_loss(logits, seg_t)
                 val_avg_loss += loss_v
                 val_metrics.update(logits, seg_t)
 
@@ -155,7 +155,7 @@ if __name__ == "__main__":
     config = args.__dict__
 
     # WRAPPED_MODEL = xmp.MpModelWrapper(SImple(n_chan=config["base_channels"], use_norm=config["use_batchnorm"]))
-    model = Conv232Unet(n_chan=config["base_channels"], spatial_size=128,
+    model = Conv232RefineNet(n_chan=config["base_channels"], spatial_size=128,
                              use_norm=config["use_batchnorm"], leaping_dim=2)
     WRAPPED_MODEL = xmp.MpModelWrapper(model)
     SERIAL_EXEC = xmp.MpSerialExecutor()
