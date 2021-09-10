@@ -78,7 +78,7 @@ def map_fn(index: int, config: dict) -> None:
         for img, seg_t in train_loader_with_tqdm:
             optimizer.zero_grad()
             logits = model(img)
-            loss = recall_ce_loss(logits, seg_t)
+            loss = soft_iou_loss(logits, seg_t)
             loss.backward()
             xm.optimizer_step(optimizer)
             train_avg_loss += loss.detach()
@@ -90,7 +90,7 @@ def map_fn(index: int, config: dict) -> None:
         with torch.no_grad():
             for img, seg_t in val_device_loader:
                 logits = model(img)
-                loss_v = recall_ce_loss(logits, seg_t)
+                loss_v = soft_iou_loss(logits, seg_t)
                 val_avg_loss += loss_v
                 val_metrics.update(logits, seg_t)
 

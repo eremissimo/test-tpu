@@ -13,7 +13,7 @@ from typing import Tuple, Optional, List
 
 def focal_loss(input: torch.Tensor, target: torch.Tensor, weight: Optional[torch.Tensor] = None,
                gamma: float = 1.0) -> torch.Tensor:
-    weight = weight.nan_to_num()
+    weight[weight.isnan()] = 0.
     weight /= weight.sum()
     ce = ff.cross_entropy(input, target, reduction="none")
     probs = torch.exp(-ce)
@@ -27,8 +27,8 @@ def focal_loss(input: torch.Tensor, target: torch.Tensor, weight: Optional[torch
 def recall_ce_loss(input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """From the unpublished article "Recall Loss for Imbalanced Image Classification and Semantic Segmentation" """
     batch_recall = recall(input, target, average='none', num_classes=input.shape[1], mdmc_average='global')
-    weight = 1.0 - batch_recall.nan_to_num(nan=1., posinf=1., neginf=1.)
-    return ff.cross_entropy(input, target, weight=weight)
+    batch_recall[batch_recall.isnan()] = 1.
+    return ff.cross_entropy(input, target, weight=(1. - batch_recall))
 
 
 def soft_iou_loss(input: torch.Tensor, target: torch.Tensor, weight: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -38,11 +38,9 @@ def soft_iou_loss(input: torch.Tensor, target: torch.Tensor, weight: Optional[to
     union = (probs + targ_probs - probs * targ_probs).sum(dim=[2, 3, 4])
     iou = intersection/union
     if weight is not None:
-        weight = weight.nan_to_num(nan=0., posinf=0., neginf=0.)
         weight /= weight.sum()
         iou *= (weight.unsqueeze(0))
-    return iou.mean()
-
+    return 1.0 - iou.mean()
 
 
 """    #############################    """
