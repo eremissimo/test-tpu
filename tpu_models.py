@@ -279,16 +279,18 @@ class ContrastAdjustment(nn.Module):
 
         On init the module initializes as near-identity
     """
-    def __init__(self, n_chan: int,  num_terms: int = 2, nd: int = 3):
+    def __init__(self, n_chan: int,  num_terms: int = 2, nd: int = 3, stds_lower_bound=0.1):
         super().__init__()
         # [terms, B, chan, X, Y, Z] broadcasting scheme (for 3d)
         shp = [num_terms, 1, n_chan] + [1]*nd
+        self.std_bound = stds_lower_bound
         self.amplitudes = nn.Parameter(0.032*torch.randn(shp), requires_grad=True)
         self.means = nn.Parameter(2*torch.rand(shp), requires_grad=True)
-        self.stds = nn.Parameter(0.25*torch.ones(shp, dtype=torch.float32), requires_grad=True)
+        self.std_logits = nn.Parameter(torch.zeros(shp, dtype=torch.float32), requires_grad=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        op = x*(1 + (self.amplitudes*torch.exp(-0.5*((x - self.means)/self.stds).square())).sum(dim=0))
+        invstds = (1./self.std_bound) * (self.std_logits.sigmoid())
+        op = x*(1 + (self.amplitudes*torch.exp(-0.5*((x - self.means)*invstds).square())).sum(dim=0))
         return op
 
 
@@ -575,23 +577,23 @@ class Conv232RefineNetCascade(Conv232RefineNet):
 
 if __name__ == "__main__":
 
-    tmp_in = torch.randn((2, 4, 128, 128, 80))
+    tmp_in = torch.randn((2, 4, 64, 64, 40))
     op2 = SImple(8)(tmp_in)
     print(op2.shape)
 
-    tmp_model = conv232_assembly(n_chan=4, spatial_size=128)
+    tmp_model = conv232_assembly(n_chan=4, spatial_size=64)
     op2 = tmp_model(tmp_in)
     print(op2.shape)
 
-    tmp_model = Conv232Unet(n_chan=4, spatial_size=128)
+    tmp_model = Conv232Unet(n_chan=4, spatial_size=64)
     op2 = tmp_model(tmp_in)
     print(op2.shape)
 
-    tmp_model = Conv232RefineNet(n_chan=4, spatial_size=128)
+    tmp_model = Conv232RefineNet(n_chan=4, spatial_size=64)
     op2 = tmp_model(tmp_in)
     print(op2.shape)
 
-    tmp_model = Conv232RefineNetCascade(n_chan=4, spatial_size=128)
+    tmp_model = Conv232RefineNetCascade(n_chan=4, spatial_size=64)
     op2 = tmp_model(tmp_in)
     print(op2.shape)
 

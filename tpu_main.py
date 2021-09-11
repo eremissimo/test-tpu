@@ -49,10 +49,12 @@ def map_fn(index: int, config: dict) -> None:
     # 3. MODELS & METRICS
     model = WRAPPED_MODEL.to(device)
     model.train()
-    per_parameter_optimizer_options = [{"params": model.contr_adjust.parameters(), "weight_decay": 0.0},
-                                       {"params": itertools.chain.from_iterable(sub.parameters() for sub in
-                                                                               model.children() if sub is not
-                                                                               model.contr_adjust),
+    # l2 regularization is applied to all weights except of contrast adjustment means and amplitudes
+    per_parameter_optimizer_options = [{"params": (par for name, par in model.named_parameters()
+                                                   if name.endswith('means') or name.endswith('amplitudes')),
+                                        "weight_decay": 0.0},
+                                       {"params": (par for name, par in model.named_parameters()
+                                                   if not (name.endswith('means') or name.endswith('amplitudes'))),
                                         "weight_decay": config["l2reg"]}]
     optimizer = optim.Adam(per_parameter_optimizer_options, lr=config["lr"])
     lr_scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=config["lr_gamma"])
