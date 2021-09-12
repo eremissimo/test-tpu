@@ -87,7 +87,7 @@ class ResLayer(nn.Module):
             module_list.append(Bn(in_channels))
         module_list.append(Conv(in_channels, in_channels, kernel_size=tn(kernel_size),
                                 padding=(kernel_size//2), bias=False, groups=groups))
-        module_list.append(nn.ReLU(inplace=True))
+        module_list.append(nn.SELU(inplace=True))
         if use_norm:
             module_list.append(Bn(in_channels))
         module_list.append(resample_layer)
@@ -101,11 +101,11 @@ class ResLayer(nn.Module):
         else:
             self.skip_branch = Convtr(in_channels, mid_channels, kernel_size=tn(2), stride=tn(2),
                                       bias=False, groups=groups)
-        self.relu = nn.ReLU(inplace=True)
+        self.selu = nn.SELU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         op = self.main_branch(x) + self.skip_branch(x)
-        op = self.relu(op)
+        op = self.selu(op)
         return op
 
 
@@ -327,7 +327,7 @@ class SImple(nn.Sequential):
     def __init__(self, n_chan, use_norm=True):
         super().__init__(
             nn.Conv3d(4, n_chan, kernel_size=t3(3), padding=1, bias=True),
-            nn.ReLU(inplace=True),
+            nn.SELU(inplace=True),
             ResLayer3d(n_chan, resampling=0, use_norm=use_norm),
             ResLayer3d(n_chan, resampling=-1, use_norm=use_norm),
             ResLayer3d(2*n_chan, resampling=-1, use_norm=use_norm),
@@ -375,7 +375,7 @@ def construct_bottleneck3d(n_chan: int, use_norm: bool = True, leaping_dim: int 
                   stride=_t31(x_downsample, leaping_dim-2),
                   padding=_t31(x_downsample//2, leaping_dim-2, 0),
                   bias=False, groups=groups),
-        nn.ReLU(inplace=True),
+        nn.SELU(inplace=True),
         ResLayer3d(4*n_chan, resampling=0, use_norm=use_norm, groups=groups),
         ResLayer3d(4*n_chan, resampling=0, use_norm=use_norm, groups=groups),
         ResLayer3d(4*n_chan, resampling=0, use_norm=use_norm, groups=groups),
@@ -384,7 +384,7 @@ def construct_bottleneck3d(n_chan: int, use_norm: bool = True, leaping_dim: int 
                            stride=_t31(x_downsample, leaping_dim-2),
                            padding=_t31(x_downsample//2 - 1, leaping_dim-2, 0),
                            output_padding=_t31(1, leaping_dim-2, 0), bias=False, groups=groups),
-        nn.ReLU(inplace=True)
+        nn.SELU(inplace=True)
     )
     return bottleneck3d
 
@@ -395,7 +395,7 @@ def conv232_assembly(n_chan: int, spatial_size: int, use_norm: bool = True, leap
     encoder2d = nn.Sequential(
         maybe_conadjust,
         nn.Conv2d(4, n_chan, kernel_size=t2(3), padding=1, bias=True),
-        nn.ReLU(inplace=True),
+        nn.SELU(inplace=True),
         ResLayer2d(n_chan, resampling=0, use_norm=use_norm),
         ResLayer2d(n_chan, resampling=-1, use_norm=use_norm),
         ResLayer2d(2*n_chan, resampling=-1, use_norm=use_norm),
@@ -435,7 +435,7 @@ class Conv232Unet(nn.Module):
         self.contr_adjust = nn.ModuleList(ContrastAdjustment2d(4, num_terms=4) for _ in range(n_ca))
         self.proj_in = nn.Sequential(
             nn.Conv2d(4*n_ca, n_chan, kernel_size=t2(kernel_size), padding=kernel_size//2, bias=True, groups=ngroups),
-            nn.ReLU(inplace=True),
+            nn.SELU(inplace=True),
         )
         self.d0 = MultiResLayer2d(n_chan, kernel_size=kernel_size, resampling=0, use_norm=use_norm, groups=ngroups)
         self.d2 = MultiResLayer2d(n_chan, kernel_size=kernel_size, resampling=-1, use_norm=use_norm, groups=ngroups)
@@ -483,11 +483,11 @@ class RCU2d(nn.Module):
         self.conv2list = nn.ModuleList(nn.Conv2d(mid_chan, in_chan, kernel_size=t2(kernel_size), padding=kernel_size//2,
                                                  groups=groups)
                                        for _ in range(n_blocks))
-        self.relu = nn.ReLU(inplace=True)
+        self.selu = nn.SELU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for conv1, conv2 in zip(self.conv1list, self.conv2list):
-            x += self.relu(conv2(self.relu(conv1(x))))
+            x += self.selu(conv2(self.selu(conv1(x))))
         return x
 
 
@@ -515,7 +515,7 @@ class Conv232RefineNet(nn.Module):
         self.contr_adjust = nn.ModuleList(ContrastAdjustment2d(4, num_terms=4) for _ in range(n_ca))
         self.proj_in = nn.Sequential(
             nn.Conv2d(4*n_ca, n_chan, kernel_size=t2(kernel_size), padding=kernel_size//2, bias=True, groups=ngroups),
-            nn.ReLU(inplace=True),
+            nn.SELU(inplace=True),
         )
         self.d0 = MultiResLayer2d(n_chan, kernel_size=kernel_size, resampling=0, use_norm=use_norm, groups=ngroups)
         self.d2 = MultiResLayer2d(n_chan, kernel_size=kernel_size, resampling=-1, use_norm=use_norm, groups=ngroups)
