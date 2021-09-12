@@ -1,17 +1,18 @@
 import os
+import itertools
 from argparse import ArgumentParser
 import torch
 import torch.nn.functional as ff
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from tpu_models import SImple
+from tpu_models import focal_loss, recall_ce_loss, soft_iou_loss, \
+    SImple, Conv232Unet, Conv232RefineNet, Conv232RefineNetCascade
 from tpu_data import download_datasets
 from tqdm import tqdm
 import torchmetrics as mtr
-from torchmetrics.classification.iou import IoU
+from torchmetrics.classification import IoU
 
-# os.environ["XLA_USE_BF16"] = 1
 
 import torch_xla
 # import torch_xla.debug.metrics as met
@@ -48,7 +49,14 @@ def map_fn(index: int, config: dict) -> None:
     # 3. MODELS & METRICS
     model = WRAPPED_MODEL.to(device)
     model.train()
-    optimizer = optim.Adam(model.parameters(), lr=config["lr"])
+    # l2 regularization is applied to all weights except of contrast adjustment means and amplitudes
+    per_parameter_optimizer_options = [{"params": (par for name, par in model.named_parameters()
+                                                   if name.endswith('means') or name.endswith('amplitudes')),
+                                        "weight_decay": 0.0},
+                                       {"params": (par for name, par in model.named_parameters()
+                                                   if not (name.endswith('means') or name.endswith('amplitudes'))),
+                                        "weight_decay": config["l2reg"]}]
+    optimizer = optim.Adam(per_parameter_optimizer_options, lr=config["lr"])
     lr_scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=config["lr_gamma"])
     val_metrics = mtr.MetricCollection({"acc": mtr.Accuracy(compute_on_step=False),
                                         "tacc": mtr.Accuracy(compute_on_step=False, ignore_index=0),
@@ -72,11 +80,11 @@ def map_fn(index: int, config: dict) -> None:
         for img, seg_t in train_loader_with_tqdm:
             optimizer.zero_grad()
             logits = model(img)
-            loss = ff.cross_entropy(logits, seg_t, weight=get_ce_weights(seg_t))
+            loss = soft_iou_loss(logits, seg_t)
             loss.backward()
             xm.optimizer_step(optimizer)
-            lr_scheduler.step()
             train_avg_loss += loss.detach()
+        lr_scheduler.step()
 
         # 5.2 validation loop
         model.eval()
@@ -84,7 +92,7 @@ def map_fn(index: int, config: dict) -> None:
         with torch.no_grad():
             for img, seg_t in val_device_loader:
                 logits = model(img)
-                loss_v = ff.cross_entropy(logits, seg_t, weight=get_ce_weights(seg_t))
+                loss_v = soft_iou_loss(logits, seg_t)
                 val_avg_loss += loss_v
                 val_metrics.update(logits, seg_t)
 
@@ -116,8 +124,8 @@ def reduce_dict(tag: str, x: dict):
 def get_ce_weights(seg_t: torch.Tensor) -> torch.Tensor:
     """ Normalization coefficients for CE loss """
     # torch.bincount is not supported by xla unfortunately
-    counts = torch.stack([(seg_t == i).sum() for i in range(N_CLASSES)])
-    weights = torch.where(counts > 0, 1.0/counts, torch.zeros(1))
+    counts = torch.stack([(seg_t == i).sum() for i in range(N_CLASSES)]).float()
+    weights = torch.where(counts > 0., 1.0/counts, torch.zeros((1,), device=counts.device))
     weights = N_CLASSES*weights/weights.sum()
     return weights
 
@@ -148,7 +156,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
     config = args.__dict__
 
-    WRAPPED_MODEL = xmp.MpModelWrapper(SImple(n_chan=config["base_channels"], use_norm=config["use_batchnorm"]))
+    # WRAPPED_MODEL = xmp.MpModelWrapper(SImple(n_chan=config["base_channels"], use_norm=config["use_batchnorm"]))
+    model = Conv232RefineNet(n_chan=config["base_channels"], spatial_size=128,
+                             use_norm=config["use_batchnorm"], leaping_dim=2)
+    WRAPPED_MODEL = xmp.MpModelWrapper(model)
     SERIAL_EXEC = xmp.MpSerialExecutor()
 
     xmp.spawn(map_fn, args=(config,), nprocs=8, start_method='fork')
