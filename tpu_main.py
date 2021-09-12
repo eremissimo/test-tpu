@@ -1,8 +1,6 @@
 import os
-import itertools
 from argparse import ArgumentParser
 import torch
-import torch.nn.functional as ff
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -80,7 +78,7 @@ def map_fn(index: int, config: dict) -> None:
         for img, seg_t in train_loader_with_tqdm:
             optimizer.zero_grad()
             logits = model(img)
-            loss = soft_iou_loss(logits, seg_t)
+            loss = soft_iou_loss(logits, seg_t, to_probs=False)
             loss.backward()
             xm.optimizer_step(optimizer)
             train_avg_loss += loss.detach()
@@ -92,7 +90,7 @@ def map_fn(index: int, config: dict) -> None:
         with torch.no_grad():
             for img, seg_t in val_device_loader:
                 logits = model(img)
-                loss_v = soft_iou_loss(logits, seg_t)
+                loss_v = soft_iou_loss(logits, seg_t, to_probs=False)
                 val_avg_loss += loss_v
                 val_metrics.update(logits, seg_t)
 
@@ -104,7 +102,9 @@ def map_fn(index: int, config: dict) -> None:
         xm.master_print(f" Epoch {epoch} training: curr loss = {loss},  avg loss = {train_avg_loss_reduced} \n",
                         f"Epoch {epoch} validation: avg loss = {val_loss_reduced},  {val_metrics_reduced}")
 
+    # TODO: save model state dict to the specified bucket
     # xm.master_print(met.metrics_report())
+    xm.rendezvous("done")
 
 
 def reduce_fn(x):

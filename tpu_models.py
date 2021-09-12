@@ -31,8 +31,9 @@ def recall_ce_loss(input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return ff.cross_entropy(input, target, weight=(1. - batch_recall))
 
 
-def soft_iou_loss(input: torch.Tensor, target: torch.Tensor, weight: Optional[torch.Tensor] = None) -> torch.Tensor:
-    probs = input.softmax(dim=1)
+def soft_iou_loss(input: torch.Tensor, target: torch.Tensor, weight: Optional[torch.Tensor] = None,
+                  to_probs: bool = False) -> torch.Tensor:
+    probs = input.softmax(dim=1) if to_probs else input
     targ_probs = ff.one_hot(target, num_classes=input.shape[1]).permute([0, 4, 1, 2, 3])
     intersection = (probs * targ_probs).sum(dim=[2, 3, 4])
     union = (probs + targ_probs - probs * targ_probs).sum(dim=[2, 3, 4])
@@ -58,6 +59,23 @@ def t2(val):
 
 def t1(val):
     return val,
+
+
+class HierarchyProbsHead(nn.Module):
+    """ Based on the idea of nested sets of segmentation areas """
+    def forward(self, logits: torch.Tensor) -> torch.Tensor:
+        # probs: 0th channel -> tumoral area (edema or enhancing tumor or necrotic core)
+        #        1st channel -> enhancing tumor or necrotic core
+        #        2nd channel -> necrotic core
+
+        # output: 0th -> health tissue
+        #         1st -> necrotic core
+        #         2nd -> edema
+        #         3rd -> enhancing tumor
+        probs = logits.sigmoid()
+        p0, p1, p2 = torch.split(probs, 1, dim=1)
+        output = torch.cat([1. - p0, p0*p1*p2, p0*(1. - p1), p0*p1*(1. - p2)], dim=1)
+        return output
 
 
 class ResLayer(nn.Module):
@@ -447,8 +465,9 @@ class Conv232Unet(nn.Module):
                                   use_norm=use_norm, groups=ngroups)
         self.u0 = MultiResLayer2d(skip_chan_mult*n_chan, n_chan, kernel_size=kernel_size, resampling=0,
                                   use_norm=use_norm, groups=ngroups)
-        self.proj_out = nn.Conv2d(n_chan, 4, kernel_size=t2(kernel_size), padding=kernel_size//2, bias=True,
-                                  groups=ngroups)
+        self.proj_out = nn.Conv2d(n_chan, 3, kernel_size=t2(kernel_size), padding=kernel_size//2, bias=True,
+                                  groups=1)
+        self.head = HierarchyProbsHead()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x0 = self.to2d(x)
@@ -462,6 +481,7 @@ class Conv232Unet(nn.Module):
         x2 = self.skip_conn_func(x2, self.u4(x4))
         x0 = self.skip_conn_func(x0, self.u2(x2))
         x0 = self.to3d(self.proj_out(self.u0(x0)))
+        x0 = self.head(x0)
         return x0
 
 
@@ -527,8 +547,9 @@ class Conv232RefineNet(nn.Module):
         self.merge = MultiResolutionFusion(in_chans=[n_chan, 2*n_chan, 4*n_chan], out_chan=n_chan,
                                            scale_factors=[1, 2, 4], upsample_mode="nearest", groups=ngroups)
         self.u0 = MultiResLayer2d(n_chan, kernel_size=kernel_size, resampling=0, use_norm=use_norm, groups=ngroups)
-        self.proj_out = nn.Conv2d(n_chan, 4, kernel_size=t2(kernel_size), padding=kernel_size//2, bias=True,
-                                  groups=ngroups)
+        self.proj_out = nn.Conv2d(n_chan, 3, kernel_size=t2(kernel_size), padding=kernel_size//2, bias=True,
+                                  groups=1)
+        self.head = HierarchyProbsHead()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x0 = self.to2d(x)
@@ -541,6 +562,7 @@ class Conv232RefineNet(nn.Module):
         x4 = self.to2d(x4)
         x0 = self.merge((x0, x2, x4))
         x0 = self.to3d(self.proj_out(self.u0(x0)))
+        x0 = self.head(x0)
         return x0
 
 
@@ -569,6 +591,7 @@ class Conv232RefineNetCascade(Conv232RefineNet):
         x2 = self.u2(x2)
         x0 = self.merge((x0, x2))
         x0 = self.to3d(self.proj_out(self.u0(x0)))
+        x0 = self.head(x0)
         return x0
 
 
