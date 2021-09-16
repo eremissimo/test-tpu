@@ -43,6 +43,51 @@ def soft_iou_loss(input: torch.Tensor, target: torch.Tensor, weight: Optional[to
     return 1.0 - iou.mean()
 
 
+class HausdorffErosion3d(nn.Module):
+    """ From the article:
+     Davood Karimi, Septimiu E. Salcudean "Reducing the Hausdorff Distance in Medical Image Segmentation with
+     Convolutional Neural Networks"
+     https://arxiv.org/abs/1904.10030
+     """
+    def __init__(self, n_classes: int, n_steps: int = 10, threshold: float = 0.7, alpha: float = 2.0,
+                 to_probs: bool = True):
+        super().__init__()
+        self.n_classes = n_classes
+        self.n_steps = n_steps
+        self.alpha = alpha
+        cross = torch.zeros((3, 3, 3), dtype=torch.float32, requires_grad=False)
+        cross[1, 1, :] = 1.
+        cross[1, :, 1] = 1.
+        cross[:, 1, 1] = 1.
+        self.kernel = (1./7./(1.-threshold))*cross.repeat((n_classes, 1, 1, 1, 1))
+        self.bias = torch.empty((n_classes,), dtype=torch.float32, requires_grad=False)
+        self.bias.fill_(-threshold/(1. - threshold))
+        self.convert_inputs_to_probs = to_probs
+
+    def forward(self, input: torch.Tensor, target: torch.Tensor, weight: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if self.convert_inputs_to_probs:
+            input = input.softmax(dim=1)
+        target = ff.one_hot(target, num_classes=self.n_classes).permute([0, 4, 1, 2, 3])
+        op = (input - target).square()
+        # erosion as convolution + thresholding
+        # soft tresholding can be viewed as a composition of a linear transform and relu
+        # linear part of that is fused with conv (kernel coefficient and bias)
+        loss_t = torch.zeros_like(input)
+        for k in range(self.n_steps):
+            op = ff.conv3d(op, self.kernel, bias=self.bias, padding=(1, 1, 1), groups=self.n_classes)
+            op.relu_()
+            loss_t += (float(k+1)**self.alpha)*op
+        if weight is not None:
+            # this dirty syntax represents even more stupid
+            # weight.unsqueeze(1).unsqueeze(2).unsqueeze(3)
+            # TODO: check if it is supported by xla without a context switch
+            weight_t = weight[(...,)+(None,)*3]
+            loss_t *= weight_t
+        # loss = (1./self.n_classes)*loss_t.sum()
+        loss = loss_t.mean()
+        return loss
+
+
 """    #############################    """
 """    #          Layers           #    """
 """    #############################    """
@@ -577,6 +622,7 @@ class Conv232RefineNetCascade(Conv232RefineNet):
 
 if __name__ == "__main__":
 
+    targ = torch.randint(4, (2, 64, 64, 40))
     tmp_in = torch.randn((2, 4, 64, 64, 40))
     op2 = SImple(8)(tmp_in)
     print(op2.shape)
@@ -596,5 +642,8 @@ if __name__ == "__main__":
     tmp_model = Conv232RefineNetCascade(n_chan=4, spatial_size=64)
     op2 = tmp_model(tmp_in)
     print(op2.shape)
+
+    loss = HausdorffErosion3d(4, n_steps=10)(op2, targ)
+    print(loss)
 
     print("woah!")

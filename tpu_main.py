@@ -6,7 +6,7 @@ import torch.nn.functional as ff
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from tpu_models import focal_loss, recall_ce_loss, soft_iou_loss, \
+from tpu_models import focal_loss, recall_ce_loss, soft_iou_loss, HausdorffErosion3d, \
     SImple, Conv232Unet, Conv232RefineNet, Conv232RefineNetCascade
 from tpu_data import download_datasets
 from tqdm import tqdm
@@ -58,17 +58,19 @@ def map_fn(index: int, config: dict) -> None:
                                         "weight_decay": config["l2reg"]}]
     optimizer = optim.Adam(per_parameter_optimizer_options, lr=config["lr"])
     lr_scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=config["lr_gamma"])
-    val_metrics = mtr.MetricCollection({"acc": mtr.Accuracy(compute_on_step=False),
-                                        "tacc": mtr.Accuracy(compute_on_step=False, ignore_index=0),
+    val_metrics = mtr.MetricCollection({"tacc": mtr.Accuracy(compute_on_step=False, ignore_index=0),
                                         "iou": IoU(num_classes=N_CLASSES, ignore_index=0, reduction='none',
                                                    compute_on_step=False)},
                                        prefix="Valid/").to(device)
     class_weights = torch.tensor([0.0028, 2.2711, 0.5229, 1.2033], device=device)   # precomputed from entire dataset
-
+    haus_weight = config["hausdorff_loss_weight"]
 
     xm.master_print("Training ........ ")
-    train_avg_loss = torch.tensor(0., device=device)
-    val_avg_loss = torch.tensor(0., device=device)
+    train_iou_loss = torch.tensor(0., dtype=torch.float32, device=device)
+    val_iou_loss = torch.tensor(0., dtype=torch.float32, device=device)
+    train_haus_loss = torch.tensor(0., dtype=torch.float32, device=device)
+    val_haus_loss = torch.tensor(0., dtype=torch.float32, device=device)
+    haus_ero_loss = HausdorffErosion3d(N_CLASSES, to_probs=True)
 
     # 5. TRAINING & VALIDATION LOOPS
     for epoch in range(config["epochs"]):
@@ -76,35 +78,49 @@ def map_fn(index: int, config: dict) -> None:
                                       disable=not xm.is_master_ordinal())
         # 5.1 training loop
         model.train()
-        train_avg_loss.zero_()
+        train_iou_loss.zero_()
+        train_haus_loss.zero_()
         for img, seg_t in train_loader_with_tqdm:
             optimizer.zero_grad()
             logits = model(img)
-            loss = soft_iou_loss(logits, seg_t)
-            loss.backward()
+            haus_loss = haus_ero_loss(logits, seg_t, weight=class_weights)
+            iou_loss = soft_iou_loss(logits, seg_t)
+            (iou_loss + haus_weight*haus_loss).backward()
             xm.optimizer_step(optimizer)
-            train_avg_loss += loss.detach()
+            train_iou_loss += iou_loss.detach()
+            train_haus_loss += haus_loss.detach()
         lr_scheduler.step()
 
         # 5.2 validation loop
         model.eval()
-        val_avg_loss.zero_()
+        val_iou_loss.zero_()
+        val_haus_loss.zero_()
         with torch.no_grad():
             for img, seg_t in val_device_loader:
                 logits = model(img)
-                loss_v = soft_iou_loss(logits, seg_t)
-                val_avg_loss += loss_v
+                iou_loss_v = soft_iou_loss(logits, seg_t)
+                haus_loss_v = haus_ero_loss(logits, seg_t, weight=class_weights)
+                val_iou_loss += iou_loss_v
+                val_haus_loss += haus_loss_v
                 val_metrics.update(logits, seg_t)
 
         # 5.3 training and validation metrics
-        train_avg_loss_reduced = reduce_val("train_loss_reduce", train_avg_loss/train_num_batches)
-        val_loss_reduced = reduce_val("val_loss_reduce", val_avg_loss/val_num_batches)
-        val_metrics_reduced = reduce_dict("val_metrics_reduce", val_metrics.compute())
+        metrics: dict = val_metrics.compute()
         val_metrics.reset()
-        xm.master_print(f" Epoch {epoch} training: curr loss = {loss},  avg loss = {train_avg_loss_reduced} \n",
-                        f"Epoch {epoch} validation: avg loss = {val_loss_reduced},  {val_metrics_reduced}")
+        metrics.update({
+            "Train/IoU": train_iou_loss/train_num_batches,
+            "Train/HausEro": train_haus_loss/train_num_batches,
+            "Valid/IoU": val_iou_loss/val_num_batches,
+            "Valid/HausEro": val_haus_loss/val_num_batches
+        })
+        metrics_reduced = reduce_dict("metrics_reduce", metrics)
+        train_metrics_reduced = {k: v for k, v in metrics_reduced.items() if k.startswith("Train")}
+        valid_metrics_reduced = {k: v for k, v in metrics_reduced.items() if k.startswith("Valid")}
+        xm.master_print(f" Epoch {epoch} training: {train_metrics_reduced} \n",
+                        f"Epoch {epoch} validation: {valid_metrics_reduced}")
 
     # xm.master_print(met.metrics_report())
+    xm.rendezvous("done!")
 
 
 def reduce_fn(x):
@@ -117,8 +133,11 @@ def reduce_val(tag: str, x: torch.Tensor):
 
 
 def reduce_dict(tag: str, x: dict):
-    x_reduced = {k: xm.mesh_reduce(tag + k, v, reduce_fn) for k, v in x.items()}
-    return x_reduced
+    """ Concat all values to a single tensor, reduce it across all tpu cores, then reconstruct the original dict """
+    cat_tensor = torch.hstack(tuple(x.values()))
+    cat_tensor_reduced = xm.mesh_reduce(tag, cat_tensor, reduce_fn)
+    x.update(zip(x, cat_tensor_reduced))
+    return x
 
 
 def get_ce_weights(seg_t: torch.Tensor) -> torch.Tensor:
@@ -152,6 +171,8 @@ if __name__ == "__main__":
                         help=" use batchnorm in the model ")
     parser.add_argument("--synthetic_data", action="store_true",
                         help=" use synthetic random data instead of downloading examples from a bucket ")
+    parser.add_argument("--hausdorff_loss_weight", type=float, default=10,
+                        help=" weight of hausdorff loss (default: 10) ")
 
     args = parser.parse_args()
     config = args.__dict__
