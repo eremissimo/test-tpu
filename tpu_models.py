@@ -43,6 +43,22 @@ def soft_iou_loss(input: torch.Tensor, target: torch.Tensor, weight: Optional[to
     return 1.0 - iou.mean()
 
 
+def hausdorff_loss(input: torch.Tensor, target: torch.Tensor, dt: torch.Tensor, weight: Optional[torch.Tensor] = None) \
+        -> torch.Tensor:
+    """One-sided hausdorff loss from the article:
+     Davood Karimi, Septimiu E. Salcudean "Reducing the Hausdorff Distance in Medical Image Segmentation with
+     Convolutional Neural Networks"
+     https://arxiv.org/abs/1904.10030
+    """
+    target = ff.one_hot(target, num_classes=input.shape[1]).permute([0, 4, 1, 2, 3])
+    input = input.softmax(dim=1)
+    loss = (input - target).square() * dt
+    if weight is not None:
+        weight /= weight.sum()
+        loss *= (weight.unsqueeze(0))
+    return loss.mean()
+
+
 class HausdorffErosion3d(nn.Module):
     """ From the article:
      Davood Karimi, Septimiu E. Salcudean "Reducing the Hausdorff Distance in Medical Image Segmentation with

@@ -1,12 +1,10 @@
 import os
-import itertools
 from argparse import ArgumentParser
 import torch
-import torch.nn.functional as ff
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from tpu_models import focal_loss, recall_ce_loss, soft_iou_loss, HausdorffErosion3d, \
+from tpu_models import soft_iou_loss, hausdorff_loss, \
     SImple, Conv232Unet, Conv232RefineNet, Conv232RefineNetCascade
 from tpu_data import download_datasets
 from tqdm import tqdm
@@ -70,7 +68,6 @@ def map_fn(index: int, config: dict) -> None:
     val_iou_loss = torch.tensor(0., dtype=torch.float32, device=device)
     train_haus_loss = torch.tensor(0., dtype=torch.float32, device=device)
     val_haus_loss = torch.tensor(0., dtype=torch.float32, device=device)
-    haus_ero_loss = HausdorffErosion3d(N_CLASSES, to_probs=True)
 
     # 5. TRAINING & VALIDATION LOOPS
     for epoch in range(config["epochs"]):
@@ -80,10 +77,10 @@ def map_fn(index: int, config: dict) -> None:
         model.train()
         train_iou_loss.zero_()
         train_haus_loss.zero_()
-        for img, seg_t in train_loader_with_tqdm:
+        for img, seg_t, dist_t in train_loader_with_tqdm:
             optimizer.zero_grad()
             logits = model(img)
-            haus_loss = haus_ero_loss(logits, seg_t, weight=class_weights)
+            haus_loss = hausdorff_loss(logits, seg_t, dist_t, weight=class_weights)
             iou_loss = soft_iou_loss(logits, seg_t)
             (iou_loss + haus_weight*haus_loss).backward()
             xm.optimizer_step(optimizer)
@@ -96,10 +93,10 @@ def map_fn(index: int, config: dict) -> None:
         val_iou_loss.zero_()
         val_haus_loss.zero_()
         with torch.no_grad():
-            for img, seg_t in val_device_loader:
+            for img, seg_t, dist_t in val_device_loader:
                 logits = model(img)
                 iou_loss_v = soft_iou_loss(logits, seg_t)
-                haus_loss_v = haus_ero_loss(logits, seg_t, weight=class_weights)
+                haus_loss_v = hausdorff_loss(logits, seg_t, dist_t, weight=class_weights)
                 val_iou_loss += iou_loss_v
                 val_haus_loss += haus_loss_v
                 val_metrics.update(logits, seg_t)
