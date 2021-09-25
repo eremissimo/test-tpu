@@ -105,10 +105,10 @@ def map_fn(index: int, config: dict) -> None:
         metrics: dict = val_metrics.compute()
         val_metrics.reset()
         metrics.update({
-            "Train/IoU": train_iou_loss/train_num_batches,
-            "Train/HausEro": train_haus_loss/train_num_batches,
-            "Valid/IoU": val_iou_loss/val_num_batches,
-            "Valid/HausEro": val_haus_loss/val_num_batches
+            "Train/iouloss": train_iou_loss/train_num_batches,
+            "Train/hausloss": train_haus_loss/train_num_batches,
+            "Valid/iouloss": val_iou_loss/val_num_batches,
+            "Valid/hausloss": val_haus_loss/val_num_batches
         })
         metrics_reduced = reduce_dict("metrics_reduce", metrics)
         train_metrics_reduced = {k: v for k, v in metrics_reduced.items() if k.startswith("Train")}
@@ -132,8 +132,10 @@ def reduce_val(tag: str, x: torch.Tensor):
 def reduce_dict(tag: str, x: dict):
     """ Concat all values to a single tensor, reduce it across all tpu cores, then reconstruct the original dict """
     cat_tensor = torch.hstack(tuple(x.values()))
+    sizes = [val.numel() for val in x.values()]
     cat_tensor_reduced = xm.mesh_reduce(tag, cat_tensor, reduce_fn)
-    x.update(zip(x, cat_tensor_reduced))
+    split_cat_tensor = (val.squeeze() for val in torch.split(cat_tensor_reduced, sizes, dim=0))
+    x.update(zip(x, split_cat_tensor))
     return x
 
 
