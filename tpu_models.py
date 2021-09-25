@@ -9,6 +9,7 @@ from typing import Tuple, Optional, List
 """    #############################    """
 """    #          Losses           #    """
 """    #############################    """
+"""TODO: move losses to a separate file """
 
 
 def focal_loss(input: torch.Tensor, target: torch.Tensor, weight: Optional[torch.Tensor] = None,
@@ -39,7 +40,8 @@ def soft_iou_loss(input: torch.Tensor, target: torch.Tensor, weight: Optional[to
     iou = intersection/union
     if weight is not None:
         weight /= weight.sum()
-        iou *= (weight.unsqueeze(0))
+        # unsqueezing for broadcasting
+        iou *= weight[None, :, None, None, None]
     return 1.0 - iou.mean()
 
 
@@ -55,7 +57,8 @@ def hausdorff_loss(input: torch.Tensor, target: torch.Tensor, dt: torch.Tensor, 
     loss = (input - target).square() * dt
     if weight is not None:
         weight /= weight.sum()
-        loss *= (weight.unsqueeze(0))
+        # unsqueezing for broadcasting
+        loss *= weight[None, :, None, None, None]
     return loss.mean()
 
 
@@ -107,6 +110,7 @@ class HausdorffErosion3d(nn.Module):
 """    #############################    """
 """    #          Layers           #    """
 """    #############################    """
+"""TODO: move layers to a separate file """
 
 
 def t3(val):

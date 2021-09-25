@@ -27,7 +27,7 @@ def download_datasets(config: dict, data_path: str) -> Tuple[Dataset, Dataset]:
         train_path = os.path.join(data_path, "train.pt")
         train_dt_path = os.path.join(data_path, "train_dt.pt")
         val_path = os.path.join(data_path, "test.pt")
-        val_dt_path = os.path.join(data_path, "test.pt")
+        val_dt_path = os.path.join(data_path, "test_dt.pt")
         os.makedirs(data_path, exist_ok=True)
         if os.path.isfile(train_path):
             print("train.pt is found in the data folder. Skipping download phase ... ")
