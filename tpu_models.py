@@ -374,6 +374,58 @@ class ContrastAdjustment1d(ContrastAdjustment):
         super().__init__(n_chan, num_terms, nd=1)
 
 
+class ContextContrastAdjustment2d(nn.Module):
+    """
+        img - [context_extractor net] - context_vector
+         \__________________________________\____[elementwise transform img with context]*num_transf
+                                                                    \____concatenated transformed img
+    """
+    def __init__(self, n_chan: int, num_transf: int = 1, n_context: int = 256):
+        super().__init__()
+        self.context_extractor = nn.Sequential(
+            nn.Conv2d(n_chan, 64, kernel_size=t2(3), stride=t2(4), dilation=t2(2), bias=True),
+            nn.SELU(),
+            nn.BatchNorm2d(64),
+            nn.Conv2d(64, 128, kernel_size=t2(3), stride=t2(2), bias=False),
+            nn.SELU(),
+            nn.BatchNorm2d(128),
+            nn.Conv2d(128, n_context, kernel_size=t2(3), stride=t2(2), bias=True)
+        )
+        self.ctx_transforms = nn.ModuleList(ContextTransform(n_chan, n_context, ffn_midlayers=[64, 64, 64])
+                                            for _ in range(num_transf))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [B, n_context, 1, 1, 1]
+        context_vector = self.context_extractor(x).mean(dim=[2, 3], keepdim=True)
+        out = torch.cat([transf(x, context_vector) for transf in self.ctx_transforms], dim=1)
+        return out
+
+
+class ContextTransform(nn.Module):
+    """A pointwise transform (MLP) of channels given the context vector """
+    def __init__(self, n_chan: int, n_context: int, ffn_midlayers: List[int]):
+        super().__init__()
+        ffn_midlayers.append(n_chan)
+        ffnl = ffn_midlayers[:-1]
+        w, *ffnr = ffn_midlayers
+        layer_list = []
+        for n1, n2 in zip(ffnl, ffnr):
+            layer_list.append(nn.SELU(inplace=True))
+            layer_list.append(nn.Linear(n1, n2))
+        self.net = nn.Sequential(*layer_list)
+        self.ctx_linear = nn.Linear(n_context, w)
+        self.chan_linear = nn.Linear(n_chan, w, bias=False)
+
+    def forward(self, img: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        # [B, 1, 1, W]
+        ctx_transformed = self.ctx_linear(context.transpose(1, 3))
+        # [B, D1, D2, D3, W]
+        img_transformed = self.chan_linear(img.permute([0, 2, 3, 1]))
+        # [B, C, D1, D2, D3]
+        out = img + self.net(ctx_transformed + img_transformed).permute([0, 3, 1, 2])
+        return out
+
+
 class DummyDebugLayer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         print(f"shape = {x.shape}")
@@ -497,7 +549,8 @@ class Conv232Unet(nn.Module):
         n_ca = 4
         self.to2d = To2d(dim_to_batch=leaping_dim)
         self.to3d = To3d(spatial_size, dim_from_batch=leaping_dim)
-        self.contr_adjust = nn.ModuleList(ContrastAdjustment2d(4, num_terms=4) for _ in range(n_ca))
+        # self.contr_adjust = nn.ModuleList(ContrastAdjustment2d(4, num_terms=4) for _ in range(n_ca))
+        self.contr_adjust = ContextContrastAdjustment2d(4, num_transf=n_ca)
         self.proj_in = nn.Sequential(
             nn.Conv2d(4*n_ca, n_chan, kernel_size=t2(kernel_size), padding=kernel_size//2, bias=True, groups=ngroups),
             nn.SELU(inplace=True),
@@ -517,7 +570,8 @@ class Conv232Unet(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x0 = self.to2d(x)
-        x0 = torch.cat([contr_adj(x0) for contr_adj in self.contr_adjust], dim=1)
+        # x0 = torch.cat([contr_adj(x0) for contr_adj in self.contr_adjust], dim=1)
+        x0 = self.contr_adjust(x0)
         x0 = self.d0(self.proj_in(x0))
         x2 = self.d2(x0)
         x4 = self.d4(x2)
@@ -577,7 +631,8 @@ class Conv232RefineNet(nn.Module):
         n_ca = 4
         self.to2d = To2d(dim_to_batch=leaping_dim)
         self.to3d = To3d(spatial_size, dim_from_batch=leaping_dim)
-        self.contr_adjust = nn.ModuleList(ContrastAdjustment2d(4, num_terms=4) for _ in range(n_ca))
+        # self.contr_adjust = nn.ModuleList(ContrastAdjustment2d(4, num_terms=4) for _ in range(n_ca))
+        self.contr_adjust = ContextContrastAdjustment2d(4, num_transf=n_ca)
         self.proj_in = nn.Sequential(
             nn.Conv2d(4*n_ca, n_chan, kernel_size=t2(kernel_size), padding=kernel_size//2, bias=True, groups=ngroups),
             nn.SELU(inplace=True),
@@ -597,7 +652,8 @@ class Conv232RefineNet(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x0 = self.to2d(x)
-        x0 = torch.cat([contr_adj(x0) for contr_adj in self.contr_adjust], dim=1)
+        # x0 = torch.cat([contr_adj(x0) for contr_adj in self.contr_adjust], dim=1)
+        x0 = self.contr_adjust(x0)
         x0 = self.d0(self.proj_in(x0))
         x2 = self.d2(x0)
         x4 = self.d4(x2)
@@ -623,7 +679,8 @@ class Conv232RefineNetCascade(Conv232RefineNet):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x0 = self.to2d(x)
-        x0 = torch.cat([contr_adj(x0) for contr_adj in self.contr_adjust], dim=1)
+        # x0 = torch.cat([contr_adj(x0) for contr_adj in self.contr_adjust], dim=1)
+        x0 = self.contr_adjust(x0)
         x0 = self.d0(self.proj_in(x0))
         x2 = self.d2(x0)
         x4 = self.d4(x2)
