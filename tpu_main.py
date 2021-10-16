@@ -177,8 +177,8 @@ if __name__ == "__main__":
     config = args.__dict__
 
     # WRAPPED_MODEL = xmp.MpModelWrapper(SImple(n_chan=config["base_channels"], use_norm=config["use_batchnorm"]))
-    model = Conv232RefineNet(n_chan=config["base_channels"], spatial_size=128,
-                             use_norm=config["use_batchnorm"], leaping_dim=2)
+    model = Conv232RefineNet(n_chan=config["base_channels"], spatial_size=80,
+                             use_norm=config["use_batchnorm"], leaping_dim=4)
     WRAPPED_MODEL = xmp.MpModelWrapper(model)
     SERIAL_EXEC = xmp.MpSerialExecutor()
 
