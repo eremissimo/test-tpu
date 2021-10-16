@@ -316,7 +316,7 @@ class To2d(nn.Module):
         # dims: batch, channels, *spatial dims
         # [B, C, X, Y, Z] -> [B, X, C, Y, Z] -> [B*X, C, Y, Z]
         # op = x.transpose(1, 2).flatten(start_dim=0, end_dim=1)
-        op = x.permute(self.perm_dims).flatten(start_dim=0, end_dim=1)   # maybe .contiguous() ?
+        op = x.permute(self.perm_dims).flatten(start_dim=0, end_dim=1)
         return op
 
 
@@ -333,7 +333,7 @@ class To3d(nn.Module):
         # restoring original dimensions
         # [B*X, C, Y, Z] -> [B, X, C, Y, Z] -> [B, C, X, Y, Z]
         # op = x.view(sz[0], sz[2], *x.shape[1:]).transpose(1, 2)
-        op = x.view(-1, self.orig_sp_size, *x.shape[1:]).permute(self.perm_dims)   # maybe .contiguous() ?
+        op = x.view(-1, self.orig_sp_size, *x.shape[1:]).permute(self.perm_dims)
         return op
 
 
@@ -372,6 +372,71 @@ class ContrastAdjustment2d(ContrastAdjustment):
 class ContrastAdjustment1d(ContrastAdjustment):
     def __init__(self, n_chan: int,  num_terms: int = 2):
         super().__init__(n_chan, num_terms, nd=1)
+
+
+class ElementwiseTransform(nn.Module):
+    """Nonlinear transformation of input channels"""
+    def __init__(self, net: nn.Module):
+        super().__init__()
+        self.net = net      # MLP
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [B, D3, D1, D2, C]
+        x = x.transpose(1, 4)
+        # [B, D3, D1, D2, C1]
+        x = self.net(x)
+        # [B, C1, D1, D2, D3]
+        x = x.transpose(1, 4)
+        return x
+
+
+class NewRefineHead(nn.Module):
+    """Patch based probability map refinement.
+                   ________________________________________[transform_net] ___ transformed_img_patch
+    image_patch __/__ [context_net] ___ context_vectors__/                       \
+    prob_patch ____/                                                              \
+            \______________________________________________________________________\__[prob_refine] ___ refined_prob
+    """
+    def __init__(self, patch_size: int = 3, n_ctx: int = 16, n_trans: int = 8, n_steps: int = 1):
+        super().__init__()
+        self.patch_size = patch_size
+        self.p2 = patch_size//2
+        self.pad_vec = [self.p2]*6
+        self.n_ctx = n_ctx
+        self.n_steps = n_steps
+        self.ctx_net = ElementwiseTransform(nn.Sequential(
+            nn.Linear(8, 16),
+            nn.SELU(),
+            nn.Linear(16, n_ctx),
+        ))
+        self.trans_net = ElementwiseTransform(nn.Sequential(
+            nn.Linear(4 + n_ctx, 16),
+            nn.SELU(),
+            nn.Linear(16, n_trans),
+        ))
+        self.mean_ker = torch.ones((n_ctx, 1) + (patch_size,)*3, dtype=torch.float32) / (patch_size ** 3)
+        self.sharpness = nn.Parameter(torch.tensor(1.))
+
+    def forward(self, img: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
+        for _ in range(self.n_steps):
+            ctx_map = self.ctx_net(torch.cat((img, probs), dim=1))
+            ctx_map = ff.conv3d(ctx_map, self.mean_ker, padding=t3(self.p2), groups=self.n_ctx)
+            # [B, n_trans, D1, D2, D3]
+            ft_map = self.trans_net(torch.cat((img, ctx_map), dim=1))
+            # p_i = sum over j \in U(i) of  p_j*exp( - sharpness * norm(ft_i - ft_j)^2)
+            # [B, n_trans, D1, D2, D3, P, P, P] where P is patch_size
+            ft_patches = ff.pad(ft_map, self.pad_vec)\
+                .unfold(2, self.patch_size, 1).unfold(3, self.patch_size, 1).unfold(4, self.patch_size, 1)
+            similarity = (ft_patches - ft_patches[..., self.p2:self.p2+1, self.p2:self.p2+1, self.p2:self.p2+1])
+            # [B, 1, D1, D2, D3, P, P, P]
+            similarity = torch.exp(-self.sharpness * similarity.norm(p=2, dim=1, keepdim=True).square())
+            similarity /= similarity.sum(dim=[5, 6, 7], keepdim=True)
+            # [B, N_CLASSES, D1, D2, D3, P, P, P]
+            prob_patches = ff.pad(probs, self.pad_vec, value=1./probs.size(1))\
+                .unfold(2, self.patch_size, 1).unfold(3, self.patch_size, 1).unfold(4, self.patch_size, 1)
+            # [B, N_CLASSES, D1, D2, D3]
+            probs = (prob_patches * similarity).sum(dim=[5, 6, 7])
+        return probs
 
 
 class DummyDebugLayer(nn.Module):
@@ -514,6 +579,7 @@ class Conv232Unet(nn.Module):
                                   use_norm=use_norm, groups=ngroups)
         self.proj_out = nn.Conv2d(n_chan, 4, kernel_size=t2(kernel_size), padding=kernel_size//2, bias=True,
                                   groups=ngroups)
+        self.refine_head = NewRefineHead(n_trans=4, n_steps=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x0 = self.to2d(x)
@@ -527,6 +593,8 @@ class Conv232Unet(nn.Module):
         x2 = self.skip_conn_func(x2, self.u4(x4))
         x0 = self.skip_conn_func(x0, self.u2(x2))
         x0 = self.to3d(self.proj_out(self.u0(x0)))
+        x0 = x0.softmax(dim=1)
+        x0 = self.refine_head(x, x0)
         return x0
 
 
@@ -594,6 +662,7 @@ class Conv232RefineNet(nn.Module):
         self.u0 = MultiResLayer2d(n_chan, kernel_size=kernel_size, resampling=0, use_norm=use_norm, groups=ngroups)
         self.proj_out = nn.Conv2d(n_chan, 4, kernel_size=t2(kernel_size), padding=kernel_size//2, bias=True,
                                   groups=ngroups)
+        self.refine_head = NewRefineHead(n_trans=4, n_steps=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x0 = self.to2d(x)
@@ -606,6 +675,8 @@ class Conv232RefineNet(nn.Module):
         x4 = self.to2d(x4)
         x0 = self.merge((x0, x2, x4))
         x0 = self.to3d(self.proj_out(self.u0(x0)))
+        x0 = x0.softmax(dim=1)
+        x0 = self.refine_head(x, x0)
         return x0
 
 
@@ -634,6 +705,8 @@ class Conv232RefineNetCascade(Conv232RefineNet):
         x2 = self.u2(x2)
         x0 = self.merge((x0, x2))
         x0 = self.to3d(self.proj_out(self.u0(x0)))
+        x0 = x0.softmax(dim=1)
+        x0 = self.refine_head(x, x0)
         return x0
 
 
@@ -663,7 +736,13 @@ if __name__ == "__main__":
     op2 = tmp_model(tmp_in)
     print(op2.shape)
 
+    tmp_model = NewRefineHead(n_steps=2)
+    tmp_probs = tmp_in.softmax(dim=1)
+    op2 = tmp_model(tmp_in, tmp_probs)
+    print(op2.shape)
+
     loss = HausdorffErosion3d(4, n_steps=10)(op2, targ)
     print(loss)
+
 
     print("woah!")
