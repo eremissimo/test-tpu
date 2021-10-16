@@ -414,7 +414,8 @@ class NewRefineHead(nn.Module):
             nn.SELU(),
             nn.Linear(16, n_trans),
         ))
-        self.mean_ker = torch.ones((n_ctx, 1) + (patch_size,)*3, dtype=torch.float32) / (patch_size ** 3)
+        mean_ker = torch.ones((n_ctx, 1) + (patch_size,)*3, dtype=torch.float32) / (patch_size ** 3)
+        self.register_buffer("mean_ker", mean_ker, persistent=False)
         self.sharpness = nn.Parameter(torch.tensor(1.))
 
     def forward(self, img: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
