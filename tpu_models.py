@@ -397,11 +397,8 @@ class NewRefineHead(nn.Module):
     prob_patch ____/                                                              \
             \______________________________________________________________________\__[prob_refine] ___ refined_prob
     """
-    def __init__(self, patch_size: int = 3, n_ctx: int = 16, n_trans: int = 8, n_steps: int = 1):
+    def __init__(self, n_ctx: int = 16, n_trans: int = 8, n_steps: int = 1):
         super().__init__()
-        self.patch_size = patch_size
-        self.p2 = patch_size//2
-        self.pad_vec = [self.p2]*6
         self.n_ctx = n_ctx
         self.n_steps = n_steps
         self.ctx_net = ElementwiseTransform(nn.Sequential(
@@ -414,30 +411,46 @@ class NewRefineHead(nn.Module):
             nn.SELU(),
             nn.Linear(16, n_trans),
         ))
-        mean_ker = torch.ones((n_ctx, 1) + (patch_size,)*3, dtype=torch.float32) / (patch_size ** 3)
+        mean_ker = torch.ones((n_ctx, 1, 3, 3, 3), dtype=torch.float32) / 27.
         self.register_buffer("mean_ker", mean_ker, persistent=False)
         self.sharpness = nn.Parameter(torch.tensor(1.))
+        self.shiftdims = [(shift, dim) for dim in (2, 3, 4) for shift in (-1, 1)]
 
     def forward(self, img: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
         for _ in range(self.n_steps):
             ctx_map = self.ctx_net(torch.cat((img, probs), dim=1))
-            ctx_map = ff.conv3d(ctx_map, self.mean_ker, padding=t3(self.p2), groups=self.n_ctx)
+            ctx_map = ff.conv3d(ctx_map, self.mean_ker, padding=t3(1), groups=self.n_ctx)
             # [B, n_trans, D1, D2, D3]
             ft_map = self.trans_net(torch.cat((img, ctx_map), dim=1))
-            # p_i = sum over j \in U(i) of  p_j*exp( - sharpness * norm(ft_i - ft_j)^2)
-            # [B, n_trans, D1, D2, D3, P, P, P] where P is patch_size
-            ft_patches = ff.pad(ft_map, self.pad_vec)\
-                .unfold(2, self.patch_size, 1).unfold(3, self.patch_size, 1).unfold(4, self.patch_size, 1)
-            similarity = (ft_patches - ft_patches[..., self.p2:self.p2+1, self.p2:self.p2+1, self.p2:self.p2+1])
-            # [B, 1, D1, D2, D3, P, P, P]
-            similarity = torch.exp(-self.sharpness * similarity.norm(p=2, dim=1, keepdim=True).square())
-            similarity /= similarity.sum(dim=[5, 6, 7], keepdim=True)
-            # [B, N_CLASSES, D1, D2, D3, P, P, P]
-            prob_patches = ff.pad(probs, self.pad_vec, value=1./probs.size(1))\
-                .unfold(2, self.patch_size, 1).unfold(3, self.patch_size, 1).unfold(4, self.patch_size, 1)
-            # [B, N_CLASSES, D1, D2, D3]
-            probs = (prob_patches * similarity).sum(dim=[5, 6, 7])
+            # instead of computing a combination of probs based on featuremap similarity coefficients over 3*3*3
+            # unfolded patches like in previous version of this class, here we compute probs and similarities only over
+            # 6-neighbor voxels and without explicit unfolding. This should be a lot faster, not so accurate though.
+            for ds in self.shiftdims:
+                probs = probs + self._prob_similarity_shifted(probs, ft_map, *ds)
+            probs = probs / probs.sum(dim=1, keepdim=True)
         return probs
+
+    def _prob_similarity_shifted(self, probs: torch.Tensor, ft_map: torch.Tensor, shift: int, dim: int) -> torch.Tensor:
+        # compute p_j*exp( - sharpness * norm(ft_i - ft_j)^2) for a single shift
+        probs_shifted = self._shift_tensor(probs, shift, dim)
+        ft_shifted = self._shift_tensor(ft_map, shift, dim)
+        similarity = torch.exp(- self.sharpness * (ft_shifted - ft_map).square().sum(dim=1, keepdim=True))
+        probs_shifted = probs_shifted*similarity
+        return probs_shifted
+
+    @staticmethod
+    def _shift_tensor(t: torch.Tensor, shift: int, dim: int) -> torch.Tensor:
+        n = t.shape[dim]
+        sl = [slice(None)]*5        # t_in.dim() == 5
+        sr = sl.copy()
+        sh_eq_1 = int(shift == 1)
+        sl[dim] = slice(0 + sh_eq_1, n - 1 + sh_eq_1)
+        sr[dim] = slice(0 + 1 - sh_eq_1, n - sh_eq_1)
+        sl = tuple(sl)
+        sr = tuple(sr)
+        t_shifted = torch.zeros_like(t)
+        t_shifted[sl] = t[sr]
+        return t_shifted
 
 
 class DummyDebugLayer(nn.Module):
@@ -737,7 +750,7 @@ if __name__ == "__main__":
     op2 = tmp_model(tmp_in)
     print(op2.shape)
 
-    tmp_model = NewRefineHead(n_steps=2)
+    tmp_model = NewRefineHead(n_steps=5)
     tmp_probs = tmp_in.softmax(dim=1)
     op2 = tmp_model(tmp_in, tmp_probs)
     print(op2.shape)
