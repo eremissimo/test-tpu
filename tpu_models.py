@@ -390,6 +390,30 @@ class ElementwiseTransform(nn.Module):
         return x
 
 
+class ResidualMLP(nn.Module):
+    """ MLP blocks with (linear) skip-connections """
+    def __init__(self, n_in: int, n_mid: int, n_out: int, n_blocks: int = 1):
+        super().__init__()
+        self.blocks = nn.ModuleList(nn.Sequential(
+            nn.Linear(n_mid, n_mid),
+            nn.SELU(),
+            nn.Linear(n_mid, n_mid)
+        ) for _ in range(n_blocks))
+        self.blocks[0][0] = nn.Linear(n_in, n_mid)
+        self.blocks[-1][-1] = nn.Linear(n_mid, n_out)
+        self.projs = nn.ModuleList(nn.Identity() for _ in range(n_blocks))
+        if n_blocks > 1:
+            self.projs[0] = nn.Linear(n_in, n_mid)
+            self.projs[-1] = nn.Linear(n_mid, n_out)
+        elif n_in != n_out:
+            self.projs[0] = nn.Linear(n_in, n_out)
+
+    def forward(self, x: torch.Tensor):
+        for proj, block in zip(self.projs, self.blocks):
+            x = proj(x) + block(x)
+        return x
+
+
 class NewRefineHead(nn.Module):
     """Patch based probability map refinement.
                    ________________________________________[transform_net] ___ transformed_img_patch
@@ -401,16 +425,8 @@ class NewRefineHead(nn.Module):
         super().__init__()
         self.n_ctx = n_ctx
         self.n_steps = n_steps
-        self.ctx_net = ElementwiseTransform(nn.Sequential(
-            nn.Linear(8, 16),
-            nn.SELU(),
-            nn.Linear(16, n_ctx),
-        ))
-        self.trans_net = ElementwiseTransform(nn.Sequential(
-            nn.Linear(4 + n_ctx, 16),
-            nn.SELU(),
-            nn.Linear(16, n_trans),
-        ))
+        self.ctx_net = ElementwiseTransform(ResidualMLP(8, 8, n_ctx, n_blocks=2))
+        self.trans_net = ElementwiseTransform(ResidualMLP(4 + n_ctx, 8, n_trans, n_blocks=2))
         mean_ker = torch.ones((n_ctx, 1, 3, 3, 3), dtype=torch.float32) / 27.
         self.register_buffer("mean_ker", mean_ker, persistent=False)
         self.sharpness = nn.Parameter(torch.tensor(1.))
@@ -750,7 +766,7 @@ if __name__ == "__main__":
     op2 = tmp_model(tmp_in)
     print(op2.shape)
 
-    tmp_model = NewRefineHead(n_steps=5)
+    tmp_model = NewRefineHead(n_steps=2)
     tmp_probs = tmp_in.softmax(dim=1)
     op2 = tmp_model(tmp_in, tmp_probs)
     print(op2.shape)
