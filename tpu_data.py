@@ -66,6 +66,19 @@ def load_from_bucket(bucket_name: str, file_path: str):
     print(f"Downloaded {filename} from gs://{bucket_name} successfully ~")
 
 
+def save_to_bucket(file_path, bucket_name):
+    """ Upload a file to the root of the specified bucket """
+    storage_client = storage.Client()
+    maybe_bucket = storage_client.lookup_bucket(bucket_name=bucket_name)
+    if maybe_bucket is None:
+        maybe_bucket = storage_client.create_bucket(bucket_name, user_project="airy-coil-321017",
+                                                    location="europe-west4-a")
+    filename = os.path.basename(file_path)
+    blob = maybe_bucket.blob(filename)
+    blob.upload_from_filename(file_path)
+    print(f"Saved {filename} to gs://{bucket_name} successfully ~")
+
+
 def random_x_flip(image: torch.Tensor, segm: torch.Tensor, dt: torch.Tensor) \
         -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """ The only used transform here is a random flip along the X axis """

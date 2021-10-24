@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tpu_models import soft_iou_loss, hausdorff_loss, \
     SImple, Conv232Unet, Conv232RefineNet, Conv232RefineNetCascade
-from tpu_data import download_datasets
+from tpu_data import download_datasets, save_to_bucket
 from tqdm import tqdm
 import torchmetrics as mtr
 from torchmetrics.classification import IoU
@@ -115,6 +115,14 @@ def map_fn(index: int, config: dict) -> None:
         valid_metrics_reduced = {k: v for k, v in metrics_reduced.items() if k.startswith("Valid")}
         xm.master_print(f" Epoch {epoch} training: {train_metrics_reduced} \n",
                         f"Epoch {epoch} validation: {valid_metrics_reduced}")
+
+    # saving model's state dict
+    if xm.is_master_ordinal():
+        model = model.to("cpu")
+        stdict_name = model._get_name() + "_weights.dat"
+        torch.save(model.state_dict(), stdict_name)
+        save_to_bucket(stdict_name, config["bucket"])
+        xm.rendezvous("done!")
 
     # xm.master_print(met.metrics_report())
     xm.rendezvous("done!")
