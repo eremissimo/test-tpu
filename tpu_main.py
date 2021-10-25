@@ -5,7 +5,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tpu_models import soft_iou_loss, hausdorff_loss, \
-    SImple, Conv232Unet, Conv232RefineNet, Conv232RefineNetCascade
+    SImple, Conv232Unet, Conv232RefineNet, RefineNetRefineHeadPretrained
 from tpu_data import download_datasets, save_to_bucket
 from tqdm import tqdm
 import torchmetrics as mtr
@@ -184,9 +184,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     config = args.__dict__
 
-    # WRAPPED_MODEL = xmp.MpModelWrapper(SImple(n_chan=config["base_channels"], use_norm=config["use_batchnorm"]))
-    model = Conv232RefineNet(n_chan=config["base_channels"], spatial_size=80,
-                             use_norm=config["use_batchnorm"], leaping_dim=4)
+    model = RefineNetRefineHeadPretrained(config["bucket"], freeze_net=True, freeze_head=False)
     WRAPPED_MODEL = xmp.MpModelWrapper(model)
     SERIAL_EXEC = xmp.MpSerialExecutor()
 

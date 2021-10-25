@@ -1,8 +1,10 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as ff
 from torchmetrics.functional.classification import recall
 from padding import get_padding
+from tpu_data import load_from_bucket
 from typing import Tuple, Optional, List
 
 
@@ -692,7 +694,6 @@ class Conv232RefineNet(nn.Module):
         self.u0 = MultiResLayer2d(n_chan, kernel_size=kernel_size, resampling=0, use_norm=use_norm, groups=ngroups)
         self.proj_out = nn.Conv2d(n_chan, 4, kernel_size=t2(kernel_size), padding=kernel_size//2, bias=True,
                                   groups=ngroups)
-        self.refine_head = NewRefineHead(n_trans=4, n_steps=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x0 = self.to2d(x)
@@ -705,9 +706,30 @@ class Conv232RefineNet(nn.Module):
         x4 = self.to2d(x4)
         x0 = self.merge((x0, x2, x4))
         x0 = self.to3d(self.proj_out(self.u0(x0)))
-        x0 = x0.softmax(dim=1)
-        x0 = self.refine_head(x, x0)
         return x0
+
+
+class RefineNetRefineHeadPretrained(nn.Module):
+    def __init__(self, bucket: Optional[str] = None, freeze_net: bool = False, freeze_head: bool = False):
+        super().__init__()
+        self.refinenet = Conv232RefineNet(n_chan=8, spatial_size=80, leaping_dim=4)
+        self.refinehead = NewRefineHead(n_trans=4, n_steps=1)
+        if bucket is not None:
+            weight_name = "Conv232RefineNet_weights.dat"
+            if not os.path.isfile(weight_name):
+                load_from_bucket(bucket, weight_name)
+            print("Loaded model state dict ~ ")
+            stdict = torch.load(weight_name)
+            self.refinenet.load_state_dict(stdict)
+        self.refinenet.requires_grad_(not freeze_net)
+        self.refinehead.requires_grad_(not freeze_head)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        o0 = self.refinenet(x)
+        o0 = o0.softmax(dim=1)
+        o0 = self.refinehead(x, o0)
+        return o0
+
 
 
 class Conv232RefineNetCascade(Conv232RefineNet):
