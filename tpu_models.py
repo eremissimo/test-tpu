@@ -34,8 +34,9 @@ def recall_ce_loss(input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return ff.cross_entropy(input, target, weight=(1. - batch_recall))
 
 
-def soft_iou_loss(input: torch.Tensor, target: torch.Tensor, weight: Optional[torch.Tensor] = None) -> torch.Tensor:
-    probs = input.softmax(dim=1)
+def soft_iou_loss(input: torch.Tensor, target: torch.Tensor, weight: Optional[torch.Tensor] = None,
+                  to_probs: bool = False) -> torch.Tensor:
+    probs = input.softmax(dim=1) if to_probs else input
     targ_probs = ff.one_hot(target, num_classes=input.shape[1]).permute([0, 4, 1, 2, 3])
     intersection = (probs * targ_probs).sum(dim=[2, 3, 4])
     union = (probs + targ_probs - probs * targ_probs).sum(dim=[2, 3, 4])
@@ -47,15 +48,16 @@ def soft_iou_loss(input: torch.Tensor, target: torch.Tensor, weight: Optional[to
     return 1.0 - iou.mean()
 
 
-def hausdorff_loss(input: torch.Tensor, target: torch.Tensor, dt: torch.Tensor, weight: Optional[torch.Tensor] = None) \
-        -> torch.Tensor:
+def hausdorff_loss(input: torch.Tensor, target: torch.Tensor, dt: torch.Tensor, weight: Optional[torch.Tensor] = None,
+                   to_probs: bool = False) -> torch.Tensor:
     """One-sided hausdorff loss from the article:
      Davood Karimi, Septimiu E. Salcudean "Reducing the Hausdorff Distance in Medical Image Segmentation with
      Convolutional Neural Networks"
      https://arxiv.org/abs/1904.10030
     """
+    if to_probs:
+        input = input.softmax(dim=1)
     target = ff.one_hot(target, num_classes=input.shape[1]).permute([0, 4, 1, 2, 3])
-    input = input.softmax(dim=1)
     loss = (input - target).square() * dt
     if weight is not None:
         weight /= weight.sum()
@@ -378,11 +380,14 @@ class ContrastAdjustment1d(ContrastAdjustment):
 
 class ElementwiseTransform(nn.Module):
     """Nonlinear transformation of input channels"""
-    def __init__(self, net: nn.Module):
+    def __init__(self, net: nn.Module, n_chan: int):
         super().__init__()
+        self.bn = nn.BatchNorm3d(n_chan)
         self.net = net      # MLP
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [B, C, D1, D2, D3]
+        x = self.bn(x)
         # [B, D3, D1, D2, C]
         x = x.transpose(1, 4)
         # [B, D3, D1, D2, C1]
@@ -427,8 +432,9 @@ class NewRefineHead(nn.Module):
         super().__init__()
         self.n_ctx = n_ctx
         self.n_steps = n_steps
-        self.ctx_net = ElementwiseTransform(ResidualMLP(8, 8, n_ctx, n_blocks=2))
-        self.trans_net = ElementwiseTransform(ResidualMLP(4 + n_ctx, 8, n_trans, n_blocks=2))
+        n_mid = 8
+        self.ctx_net = ElementwiseTransform(ResidualMLP(8, n_mid, n_ctx, n_blocks=2), n_chan=8)
+        self.trans_net = ElementwiseTransform(ResidualMLP(4 + n_ctx, n_mid, n_trans, n_blocks=2), n_chan=(4+n_ctx))
         mean_ker = torch.ones((n_ctx, 1, 3, 3, 3), dtype=torch.float32) / 27.
         self.register_buffer("mean_ker", mean_ker, persistent=False)
         self.sharpness = nn.Parameter(torch.tensor(1.))
@@ -439,20 +445,23 @@ class NewRefineHead(nn.Module):
             ctx_map = self.ctx_net(torch.cat((img, probs), dim=1))
             ctx_map = ff.conv3d(ctx_map, self.mean_ker, padding=t3(1), groups=self.n_ctx)
             # [B, n_trans, D1, D2, D3]
-            ft_map = self.trans_net(torch.cat((img, ctx_map), dim=1))
+            # note the softmax! It's important for similarity as dot product
+            ft_map = (4.0*self.trans_net(torch.cat((img, ctx_map), dim=1))).softmax(dim=1)
             # instead of computing a combination of probs based on featuremap similarity coefficients over 3*3*3
             # unfolded patches like in previous version of this class, here we compute probs and similarities only over
             # 6-neighbor voxels and without explicit unfolding. This should be a lot faster, not so accurate though.
             for ds in self.shiftdims:
                 probs = probs + self._prob_similarity_shifted(probs, ft_map, *ds)
-            probs = probs / probs.sum(dim=1, keepdim=True)
+            # normalize
+            # probs = (4.0*probs).softmax(dim=1)
+            probs = probs / (probs.sum(dim=1, keepdim=True) + 1e-8)
         return probs
 
     def _prob_similarity_shifted(self, probs: torch.Tensor, ft_map: torch.Tensor, shift: int, dim: int) -> torch.Tensor:
         # compute p_j*exp( - sharpness * norm(ft_i - ft_j)^2) for a single shift
         probs_shifted = self._shift_tensor(probs, shift, dim)
         ft_shifted = self._shift_tensor(ft_map, shift, dim)
-        similarity = torch.exp(- self.sharpness * (ft_shifted - ft_map).square().sum(dim=1, keepdim=True))
+        similarity = (ft_shifted*ft_map).sum(dim=1, keepdim=True)   # \in [0, 1]
         probs_shifted = probs_shifted*similarity
         return probs_shifted
 
@@ -714,7 +723,7 @@ class RefineNetRefineHeadPretrained(nn.Module):
         super().__init__()
         self.refinenet = Conv232RefineNet(n_chan=8, spatial_size=80, leaping_dim=4)
         self.refinehead = NewRefineHead(n_trans=4, n_steps=1)
-        if bucket is not None:
+        if (bucket is not None) and freeze_net:
             weight_name = "Conv232RefineNet_weights.dat"
             if not os.path.isfile(weight_name):
                 load_from_bucket(bucket, weight_name)
@@ -726,7 +735,7 @@ class RefineNetRefineHeadPretrained(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         o0 = self.refinenet(x)
-        o0 = o0.softmax(dim=1)
+        o0 = (4.0*o0).softmax(dim=1)
         o0 = self.refinehead(x, o0)
         return o0
 
@@ -757,8 +766,6 @@ class Conv232RefineNetCascade(Conv232RefineNet):
         x2 = self.u2(x2)
         x0 = self.merge((x0, x2))
         x0 = self.to3d(self.proj_out(self.u0(x0)))
-        x0 = x0.softmax(dim=1)
-        x0 = self.refine_head(x, x0)
         return x0
 
 
