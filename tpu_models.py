@@ -403,7 +403,7 @@ class ResidualMLP(nn.Module):
         super().__init__()
         self.blocks = nn.ModuleList(nn.Sequential(
             nn.Linear(n_mid, n_mid),
-            nn.SELU(),
+            nn.Tanh(),
             nn.Linear(n_mid, n_mid)
         ) for _ in range(n_blocks))
         self.blocks[0][0] = nn.Linear(n_in, n_mid)
