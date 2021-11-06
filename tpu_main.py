@@ -184,7 +184,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     config = args.__dict__
 
-    model = RefineNetRefineHeadPretrained(config["bucket"], freeze_net=True, freeze_head=False)
+    model = RefineNetRefineHeadPretrained(config["bucket"], freeze_net=False, freeze_head=False)
     WRAPPED_MODEL = xmp.MpModelWrapper(model)
     SERIAL_EXEC = xmp.MpSerialExecutor()
 
