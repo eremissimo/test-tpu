@@ -1,8 +1,10 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as ff
 from torchmetrics.functional.classification import recall
 from padding import get_padding
+from tpu_data import load_from_bucket
 from typing import Tuple, Optional, List
 
 
@@ -32,8 +34,9 @@ def recall_ce_loss(input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return ff.cross_entropy(input, target, weight=(1. - batch_recall))
 
 
-def soft_iou_loss(input: torch.Tensor, target: torch.Tensor, weight: Optional[torch.Tensor] = None) -> torch.Tensor:
-    probs = input.softmax(dim=1)
+def soft_iou_loss(input: torch.Tensor, target: torch.Tensor, weight: Optional[torch.Tensor] = None,
+                  to_probs: bool = False) -> torch.Tensor:
+    probs = input.softmax(dim=1) if to_probs else input
     targ_probs = ff.one_hot(target, num_classes=input.shape[1]).permute([0, 4, 1, 2, 3])
     intersection = (probs * targ_probs).sum(dim=[2, 3, 4])
     union = (probs + targ_probs - probs * targ_probs).sum(dim=[2, 3, 4])
@@ -45,15 +48,16 @@ def soft_iou_loss(input: torch.Tensor, target: torch.Tensor, weight: Optional[to
     return 1.0 - iou.mean()
 
 
-def hausdorff_loss(input: torch.Tensor, target: torch.Tensor, dt: torch.Tensor, weight: Optional[torch.Tensor] = None) \
-        -> torch.Tensor:
+def hausdorff_loss(input: torch.Tensor, target: torch.Tensor, dt: torch.Tensor, weight: Optional[torch.Tensor] = None,
+                   to_probs: bool = False) -> torch.Tensor:
     """One-sided hausdorff loss from the article:
      Davood Karimi, Septimiu E. Salcudean "Reducing the Hausdorff Distance in Medical Image Segmentation with
      Convolutional Neural Networks"
      https://arxiv.org/abs/1904.10030
     """
+    if to_probs:
+        input = input.softmax(dim=1)
     target = ff.one_hot(target, num_classes=input.shape[1]).permute([0, 4, 1, 2, 3])
-    input = input.softmax(dim=1)
     loss = (input - target).square() * dt
     if weight is not None:
         weight /= weight.sum()
@@ -316,7 +320,7 @@ class To2d(nn.Module):
         # dims: batch, channels, *spatial dims
         # [B, C, X, Y, Z] -> [B, X, C, Y, Z] -> [B*X, C, Y, Z]
         # op = x.transpose(1, 2).flatten(start_dim=0, end_dim=1)
-        op = x.permute(self.perm_dims).flatten(start_dim=0, end_dim=1)   # maybe .contiguous() ?
+        op = x.permute(self.perm_dims).flatten(start_dim=0, end_dim=1)
         return op
 
 
@@ -333,7 +337,7 @@ class To3d(nn.Module):
         # restoring original dimensions
         # [B*X, C, Y, Z] -> [B, X, C, Y, Z] -> [B, C, X, Y, Z]
         # op = x.view(sz[0], sz[2], *x.shape[1:]).transpose(1, 2)
-        op = x.view(-1, self.orig_sp_size, *x.shape[1:]).permute(self.perm_dims)   # maybe .contiguous() ?
+        op = x.view(-1, self.orig_sp_size, *x.shape[1:]).permute(self.perm_dims)
         return op
 
 
@@ -372,6 +376,108 @@ class ContrastAdjustment2d(ContrastAdjustment):
 class ContrastAdjustment1d(ContrastAdjustment):
     def __init__(self, n_chan: int,  num_terms: int = 2):
         super().__init__(n_chan, num_terms, nd=1)
+
+
+class ElementwiseTransform(nn.Module):
+    """Nonlinear transformation of input channels"""
+    def __init__(self, net: nn.Module, n_chan: int):
+        super().__init__()
+        self.bn = nn.BatchNorm3d(n_chan)
+        self.net = net      # MLP
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [B, C, D1, D2, D3]
+        x = self.bn(x)
+        # [B, D3, D1, D2, C]
+        x = x.transpose(1, 4)
+        # [B, D3, D1, D2, C1]
+        x = self.net(x)
+        # [B, C1, D1, D2, D3]
+        x = x.transpose(1, 4)
+        return x
+
+
+class ResidualMLP(nn.Module):
+    """ MLP blocks with (linear) skip-connections """
+    def __init__(self, n_in: int, n_mid: int, n_out: int, n_blocks: int = 1):
+        super().__init__()
+        self.blocks = nn.ModuleList(nn.Sequential(
+            nn.Linear(n_mid, n_mid),
+            nn.Tanh(),
+            nn.Linear(n_mid, n_mid)
+        ) for _ in range(n_blocks))
+        self.blocks[0][0] = nn.Linear(n_in, n_mid)
+        self.blocks[-1][-1] = nn.Linear(n_mid, n_out)
+        self.projs = nn.ModuleList(nn.Identity() for _ in range(n_blocks))
+        if n_blocks > 1:
+            self.projs[0] = nn.Linear(n_in, n_mid)
+            self.projs[-1] = nn.Linear(n_mid, n_out)
+        elif n_in != n_out:
+            self.projs[0] = nn.Linear(n_in, n_out)
+
+    def forward(self, x: torch.Tensor):
+        for proj, block in zip(self.projs, self.blocks):
+            x = proj(x) + block(x)
+        return x
+
+
+class NewRefineHead(nn.Module):
+    """Patch based probability map refinement.
+                   ________________________________________[transform_net] ___ transformed_img_patch
+    image_patch __/__ [context_net] ___ context_vectors__/                       \
+    prob_patch ____/                                                              \
+            \______________________________________________________________________\__[prob_refine] ___ refined_prob
+    """
+    def __init__(self, n_ctx: int = 16, n_trans: int = 8, n_steps: int = 1):
+        super().__init__()
+        self.n_ctx = n_ctx
+        self.n_steps = n_steps
+        n_mid = 8
+        self.ctx_net = ElementwiseTransform(ResidualMLP(8, n_mid, n_ctx, n_blocks=2), n_chan=8)
+        self.trans_net = ElementwiseTransform(ResidualMLP(4 + n_ctx, n_mid, n_trans, n_blocks=2), n_chan=(4+n_ctx))
+        mean_ker = torch.ones((n_ctx, 1, 3, 3, 3), dtype=torch.float32) / 27.
+        self.register_buffer("mean_ker", mean_ker, persistent=False)
+        self.sharpness = nn.Parameter(torch.tensor(1.))
+        self.shiftdims = [(shift, dim) for dim in (2, 3, 4) for shift in (-1, 1)]
+
+    def forward(self, img: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
+        for _ in range(self.n_steps):
+            ctx_map = self.ctx_net(torch.cat((img, probs), dim=1))
+            ctx_map = ff.conv3d(ctx_map, self.mean_ker, padding=t3(1), groups=self.n_ctx)
+            # [B, n_trans, D1, D2, D3]
+            # note the softmax! It's important for similarity as dot product
+            ft_map = (4.0*self.trans_net(torch.cat((img, ctx_map), dim=1))).softmax(dim=1)
+            # instead of computing a combination of probs based on featuremap similarity coefficients over 3*3*3
+            # unfolded patches like in previous version of this class, here we compute probs and similarities only over
+            # 6-neighbor voxels and without explicit unfolding. This should be a lot faster, not so accurate though.
+            for ds in self.shiftdims:
+                probs = probs + self._prob_similarity_shifted(probs, ft_map, *ds)
+            # normalize
+            # probs = (4.0*probs).softmax(dim=1)
+            probs = probs / (probs.sum(dim=1, keepdim=True) + 1e-8)
+        return probs
+
+    def _prob_similarity_shifted(self, probs: torch.Tensor, ft_map: torch.Tensor, shift: int, dim: int) -> torch.Tensor:
+        # compute p_j*exp( - sharpness * norm(ft_i - ft_j)^2) for a single shift
+        probs_shifted = self._shift_tensor(probs, shift, dim)
+        ft_shifted = self._shift_tensor(ft_map, shift, dim)
+        similarity = (ft_shifted*ft_map).sum(dim=1, keepdim=True)   # \in [0, 1]
+        probs_shifted = probs_shifted*similarity
+        return probs_shifted
+
+    @staticmethod
+    def _shift_tensor(t: torch.Tensor, shift: int, dim: int) -> torch.Tensor:
+        n = t.shape[dim]
+        sl = [slice(None)]*5        # t_in.dim() == 5
+        sr = sl.copy()
+        sh_eq_1 = int(shift == 1)
+        sl[dim] = slice(0 + sh_eq_1, n - 1 + sh_eq_1)
+        sr[dim] = slice(0 + 1 - sh_eq_1, n - sh_eq_1)
+        sl = tuple(sl)
+        sr = tuple(sr)
+        t_shifted = torch.zeros_like(t)
+        t_shifted[sl] = t[sr]
+        return t_shifted
 
 
 class DummyDebugLayer(nn.Module):
@@ -514,6 +620,7 @@ class Conv232Unet(nn.Module):
                                   use_norm=use_norm, groups=ngroups)
         self.proj_out = nn.Conv2d(n_chan, 4, kernel_size=t2(kernel_size), padding=kernel_size//2, bias=True,
                                   groups=ngroups)
+        self.refine_head = NewRefineHead(n_trans=4, n_steps=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x0 = self.to2d(x)
@@ -527,6 +634,8 @@ class Conv232Unet(nn.Module):
         x2 = self.skip_conn_func(x2, self.u4(x4))
         x0 = self.skip_conn_func(x0, self.u2(x2))
         x0 = self.to3d(self.proj_out(self.u0(x0)))
+        x0 = x0.softmax(dim=1)
+        x0 = self.refine_head(x, x0)
         return x0
 
 
@@ -609,6 +718,29 @@ class Conv232RefineNet(nn.Module):
         return x0
 
 
+class RefineNetRefineHeadPretrained(nn.Module):
+    def __init__(self, bucket: Optional[str] = None, freeze_net: bool = False, freeze_head: bool = False):
+        super().__init__()
+        self.refinenet = Conv232RefineNet(n_chan=8, spatial_size=80, leaping_dim=4)
+        self.refinehead = NewRefineHead(n_trans=4, n_steps=1)
+        if (bucket is not None) and freeze_net:
+            weight_name = "Conv232RefineNet_weights.dat"
+            if not os.path.isfile(weight_name):
+                load_from_bucket(bucket, weight_name)
+            print("Loaded model state dict ~ ")
+            stdict = torch.load(weight_name)
+            self.refinenet.load_state_dict(stdict)
+        self.refinenet.requires_grad_(not freeze_net)
+        self.refinehead.requires_grad_(not freeze_head)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        o0 = self.refinenet(x)
+        o0 = (4.0*o0).softmax(dim=1)
+        o0 = self.refinehead(x, o0)
+        return o0
+
+
+
 class Conv232RefineNetCascade(Conv232RefineNet):
     def __init__(self, n_chan: int, spatial_size: int, kernel_size: int = 3, use_norm: bool = True,
                  leaping_dim: int = 2):
@@ -663,7 +795,13 @@ if __name__ == "__main__":
     op2 = tmp_model(tmp_in)
     print(op2.shape)
 
+    tmp_model = NewRefineHead(n_steps=2)
+    tmp_probs = tmp_in.softmax(dim=1)
+    op2 = tmp_model(tmp_in, tmp_probs)
+    print(op2.shape)
+
     loss = HausdorffErosion3d(4, n_steps=10)(op2, targ)
     print(loss)
+
 
     print("woah!")
