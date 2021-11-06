@@ -1,6 +1,7 @@
 import os
 from argparse import ArgumentParser
 import torch
+import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -84,6 +85,7 @@ def map_fn(index: int, config: dict) -> None:
             iou_loss = soft_iou_loss(logits, seg_t)
             (iou_loss + haus_weight*haus_loss).backward()
             xm.optimizer_step(optimizer)
+            reduce_batchnorm_simple(model)     # synch bns' running stats across all devices
             train_iou_loss += iou_loss.detach()
             train_haus_loss += haus_loss.detach()
         lr_scheduler.step()
@@ -122,7 +124,6 @@ def map_fn(index: int, config: dict) -> None:
         stdict_name = model._get_name() + "_weights.dat"
         torch.save(model.state_dict(), stdict_name)
         save_to_bucket(stdict_name, config["bucket"])
-        xm.rendezvous("done!")
 
     # xm.master_print(met.metrics_report())
     xm.rendezvous("done!")
@@ -145,6 +146,31 @@ def reduce_dict(tag: str, x: dict):
     split_cat_tensor = (val.squeeze() for val in torch.split(cat_tensor_reduced, sizes, dim=0))
     x.update(zip(x, split_cat_tensor))
     return x
+
+
+def reduce_batchnorm_simple(net: nn.Module):
+    """ From this issue:
+    https://github.com/pytorch/xla/issues/2843
+
+    BTW, the correct way of variance reduction is via the law of total variance i.e.
+    total variance = mean of vars + var of means,
+    but this simple reduction (mean of vars) should work too, I think.
+    """
+    for m in net.modules():
+        if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm3d)):
+            xm.all_reduce(xm.REDUCE_SUM, m.running_mean, scale=1.0 / xm.xrt_world_size())
+            xm.all_reduce(xm.REDUCE_SUM, m.running_var, scale=1.0 / xm.xrt_world_size())
+
+
+def reduce_batchnorm_complicated(net: nn.Module):
+    """Fixed version of reduce_batchnorm. Just for some tests"""
+    for m in net.modules():
+        if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm3d)):
+            rm2 = m.running_mean.clone().square()
+            xm.all_reduce(xm.REDUCE_SUM, m.running_mean, scale=1.0 / xm.xrt_world_size())
+            xm.all_reduce(xm.REDUCE_SUM, m.running_var, scale=1.0 / xm.xrt_world_size())
+            xm.all_reduce(xm.REDUCE_SUM, rm2, scale=1.0 / xm.xrt_world_size())
+            m.running_var += (rm2 - m.running_mean.square())
 
 
 def get_ce_weights(seg_t: torch.Tensor) -> torch.Tensor:
