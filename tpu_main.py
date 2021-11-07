@@ -162,17 +162,6 @@ def reduce_batchnorm_simple(net: nn.Module):
             xm.all_reduce(xm.REDUCE_SUM, m.running_var, scale=1.0 / xm.xrt_world_size())
 
 
-def reduce_batchnorm_complicated(net: nn.Module):
-    """Fixed version of reduce_batchnorm. Just for some tests"""
-    for m in net.modules():
-        if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm3d)):
-            rm2 = m.running_mean.clone().square()
-            xm.all_reduce(xm.REDUCE_SUM, m.running_mean, scale=1.0 / xm.xrt_world_size())
-            xm.all_reduce(xm.REDUCE_SUM, m.running_var, scale=1.0 / xm.xrt_world_size())
-            xm.all_reduce(xm.REDUCE_SUM, rm2, scale=1.0 / xm.xrt_world_size())
-            m.running_var += (rm2 - m.running_mean.square())
-
-
 def get_ce_weights(seg_t: torch.Tensor) -> torch.Tensor:
     """ Normalization coefficients for CE loss """
     # torch.bincount is not supported by xla unfortunately
